@@ -47,14 +47,35 @@ pub struct WorldDb(pub Arc<Db>);
 
 pub fn check_shutdown(
     mut commands: Commands,
-    mut clients: Query<(&mut Client, Entity)>,
+    mut clients: Query<(&mut Client, Entity, &Position, &Look, &UniqueId)>,
     mut layers: Query<&mut ChunkLayer>,
     mut exit: EventWriter<AppExit>,
+    world_db: Res<WorldDb>,
 ) {
     if SHUTDOWN.load(Ordering::SeqCst) {
         log_info!("Initiating server shutdown sequence...");
-        for (mut client, entity) in clients.iter_mut() {
+        for (mut client, entity, pos, look, uuid) in clients.iter_mut() {
             client.send_chat_message("Server is shutting down!");
+
+            let p_data = world::PlayerData {
+                position: (pos.0.x, pos.0.y, pos.0.z),
+                yaw: look.yaw,
+                pitch: look.pitch,
+            };
+
+            let client_uuid = uuid.0;
+            let db_key = format!("player_{}", client_uuid);
+
+            if let Ok(encoded) = postcard::to_allocvec(&p_data) {
+                use std::io::Write;
+                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                if encoder.write_all(&encoded).is_ok() {
+                    if let Ok(compressed) = encoder.finish() {
+                        let _ = world_db.0.insert(db_key, compressed);
+                    }
+                }
+            }
+
             commands.entity(entity).insert(valence::prelude::Despawned);
         }
         

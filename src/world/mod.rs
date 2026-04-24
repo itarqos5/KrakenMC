@@ -4,6 +4,11 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
+use std::io::{Read, Write};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use serde::{Deserialize, Serialize};
 
 use flume::{Receiver, Sender};
 use noise::{NoiseFn, Perlin};
@@ -76,6 +81,13 @@ pub fn setup_world(
     commands.spawn(layer);
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct PlayerData {
+    pub position: (f64, f64, f64),
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
 pub fn init_clients(
     mut clients: Query<
         (
@@ -83,22 +95,27 @@ pub fn init_clients(
             &mut VisibleChunkLayer,
             &mut VisibleEntityLayers,
             &mut Position,
+            &mut Look,
             &mut GameMode,
             &mut IsFlat,
             &mut Client,
+            &UniqueId
         ),
         Added<Client>,
     >,
     layers: Query<Entity, (With<ChunkLayer>, With<EntityLayer>)>,
+    world_db: Res<WorldDb>,
 ) {
     for (
         mut layer_id,
         mut visible_chunk_layer,
         mut visible_entity_layers,
         mut pos,
+        mut look,
         mut game_mode,
         mut is_flat,
         mut client,
+        uuid
     ) in &mut clients
     {
         let layer = layers.single();
@@ -106,12 +123,36 @@ pub fn init_clients(
         layer_id.0 = layer;
         visible_chunk_layer.0 = layer;
         visible_entity_layers.0.insert(layer);
-        pos.set(SPAWN_POS);
+        
+        let client_uuid = uuid.0;
+        let db_key = format!("player_{}", client_uuid);
+        
+        let mut spawn_pos = SPAWN_POS;
+        let mut spawn_yaw = 0.0;
+        let mut spawn_pitch = 0.0;
+
+        if let Ok(Some(data)) = world_db.0.get(&db_key) {
+            let mut decoder = GzDecoder::new(&data[..]);
+            let mut decompressed = Vec::new();
+            if decoder.read_to_end(&mut decompressed).is_ok() {
+                if let Ok(p_data) = postcard::from_bytes::<PlayerData>(&decompressed) {
+                    spawn_pos = DVec3::new(p_data.position.0, p_data.position.1, p_data.position.2);
+                    spawn_yaw = p_data.yaw;
+                    spawn_pitch = p_data.pitch;
+                    client.send_chat_message("Welcome back to Kraken! Your data was restored.");
+                }
+            }
+        } else {
+            client.send_chat_message("Welcome to Kraken! You are a new player.");
+        }
+
+        pos.set(spawn_pos);
+        look.yaw = spawn_yaw;
+        look.pitch = spawn_pitch;
         *game_mode = GameMode::Creative;
         is_flat.0 = false;
         
         client.set_brand("Kraken");
-        client.send_chat_message("Welcome to Kraken!");
     }
 }
 

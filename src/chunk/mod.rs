@@ -34,7 +34,18 @@ pub fn chunk_worker(state: Arc<ChunkWorkerState>) {
                     let world_height = (70.0 + noise_val * 40.0) as i32; // Higher base and larger variation
                     let top_y = (world_height - state.min_y).clamp(0, state.height as i32 - 1) as u32;
 
-                    for y in 0..=top_y {
+                    // Deepslate Geology Layer
+                    for y in 0..=top_y.min(state.height / 3) {
+                        chunk.set_block(x, y, z, BlockState::DEEPSLATE);
+                    }
+                    if state.min_y > -64 {
+                        let bedrock_noise = state.terrain.get([world_x as f64 * 4.0, world_z as f64 * 4.0]);
+                        if bedrock_noise > -0.5 {
+                             chunk.set_block(x, 0, z, BlockState::BEDROCK);
+                        }
+                    }
+
+                    for y in top_y.min(state.height / 3) + 1..=top_y {
                         let block = if y == top_y { BlockState::GRASS_BLOCK } else if y + 3 >= top_y { BlockState::DIRT } else { BlockState::STONE };
                         chunk.set_block(x, y, z, block);
                     }

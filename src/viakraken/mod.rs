@@ -120,27 +120,15 @@ impl ViaKraken {
             
             log_warn!("Detected connection from {} with protocol {}", peer_addr, protocol);
             // Accepted: backend target directly, or versions we can attempt to rewrite.
-            let supported = protocol == target_protocol || (763..=776).contains(&protocol);
+            let supported = protocol == target_protocol || (767..=776).contains(&protocol);
             if !supported {
-                log_warn!("Rejected connection from {} (Unsupported Protocol: {})", peer_addr, protocol);
-                return Ok(()); // Drop connection
-            }
-            
-            if protocol != target_protocol {
                 if next_state == 2 {
-                    // Quick sleep or consume Login Start so we don't cause a TCP RST
-                    use tokio::io::AsyncReadExt;
-                    let mut dummy_buf = [0u8; 1024];
-                    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), stream.read(&mut dummy_buf)).await;
-
-                    // Return a nice disconnect message rather than closing TCP blindly
-                    let reason = format!(r#"{{"text":"ViaKraken protocol translation ({} -> {}) is still a WIP! Please join on 1.20.1."}}"#, protocol, target_protocol);
+                    // Return a nice disconnect message representing required versions
+                    let reason = format!(r#"{{"text":"Kraken requires 1.21 - 1.21.11. Please upgrade your client."}}"#);
+                    
                     let mut reason_data = vec![];
+                    reason_data.push(0x00); // Disconnect packet in Login State is ID 0x00
                     
-                    // Disconnect packet in Login State is ID 0x00
-                    reason_data.push(0x00);
-                    
-                    // Encode reason string length
                     let mut val = reason.len() as u32;
                     loop {
                         let mut temp = (val & 0b01111111) as u8;
@@ -149,10 +137,8 @@ impl ViaKraken {
                         reason_data.push(temp);
                         if val == 0 { break; }
                     }
-                    
                     reason_data.extend_from_slice(reason.as_bytes());
 
-                    // Encode packet length
                     let mut final_pkt = vec![];
                     let mut val = reason_data.len() as u32;
                     loop {
@@ -167,10 +153,12 @@ impl ViaKraken {
                     use tokio::io::AsyncWriteExt;
                     let _ = stream.write_all(&final_pkt).await;
                     let _ = stream.shutdown().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    return Ok(());
                 }
+                log_warn!("Rejected connection from {} (Unsupported Protocol: {})", peer_addr, protocol);
+                return Ok(()); // Drop connection
+            }
                 
+            if protocol != target_protocol {
                 log_info!(
                     "ViaKraken starting translation stream for {} -> {}",
                     protocol,
