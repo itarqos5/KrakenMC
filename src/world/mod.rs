@@ -4,10 +4,8 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
-use std::io::{Read, Write};
+use std::io::Read;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde::{Deserialize, Serialize};
 
 use flume::{Receiver, Sender};

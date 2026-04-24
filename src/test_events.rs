@@ -5,9 +5,17 @@ use valence::action::DiggingEvent;
 use valence::interact_block::InteractBlockEvent;
 
 pub fn test_system(
-    mut messages: EventReader<ChatMessageEvent>,
-    mut commands: EventReader<CommandExecutionEvent>,
-    mut dig: EventReader<DiggingEvent>,
-    mut interact: EventReader<InteractBlockEvent>,
+    mut _messages: EventReader<ChatMessageEvent>,
+    mut _commands: EventReader<CommandExecutionEvent>,
+    mut dig_events: EventReader<DiggingEvent>,
+    mut _interact: EventReader<InteractBlockEvent>,
+    mut layers: Query<&mut ChunkLayer>,
 ) {
+    for event in dig_events.read() {
+        if event.state == valence::action::DiggingState::Stop {
+            if let Ok(mut layer) = layers.get_single_mut() {
+                layer.set_block(event.position, BlockState::AIR);
+            }
+        }
+    }
 }
