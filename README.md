@@ -1,6 +1,6 @@
 <div align="center">
   <h1>🦑 Kraken Minecraft Server</h1>
-  <p><strong>High-performance Minecraft 1.21.1 server engine utilizing SIMD optimizations and an ECS architecture.</strong></p>
+  <p><strong>High-performance Minecraft 1.21.11 server engine utilizing SIMD optimizations and an ECS architecture.</strong></p>
 </div>
 
 ---
