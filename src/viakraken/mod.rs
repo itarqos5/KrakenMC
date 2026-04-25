@@ -1,3 +1,5 @@
+use bevy_app::Plugin;
+use bevy_ecs::prelude::*;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -5,6 +7,16 @@ use crate::config::ServerConfig;
 use crate::logger::{log_error, log_info};
 
 mod proxy;
+
+pub struct ViaKrakenPlugin {
+    pub config: Arc<ServerConfig>,
+}
+
+impl Plugin for ViaKrakenPlugin {
+    fn build(&self, _app: &mut bevy_app::App) {
+        // Plugin initialization would set up TCP binding, perhaps using a background Tokio runtime
+    }
+}
 
 pub struct ViaKraken {
     pub config: Arc<ServerConfig>,

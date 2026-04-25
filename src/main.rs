@@ -13,6 +13,8 @@ mod logger;
 mod viakraken;
 mod world;
 mod systems;
+mod handlers;
+mod packet;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
