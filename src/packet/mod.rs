@@ -1,5 +1,3 @@
-pub mod handlers;
-
 // This module orchestrates Azalea packet handling logic.
 // You'll want to decode `Clientbound` vs `Serverbound` packets
 // and dispatch them to the correct ECS systems or handlers.
