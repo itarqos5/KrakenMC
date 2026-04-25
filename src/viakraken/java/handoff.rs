@@ -6,6 +6,7 @@ use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
 use pumpkin_protocol::java::server::login::SLoginAcknowledged;
 use pumpkin_protocol::Property;
 use pumpkin_util::version::MinecraftVersion;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
@@ -25,11 +26,6 @@ pub(super) async fn relay_login_handoff(
     version: MinecraftVersion,
     fallback_username: &str,
 ) -> std::io::Result<Option<String>> {
-    enum Phase {
-        Login,
-        Config,
-    }
-
     let login_success_id =
         packet_id_for_version::<CLoginSuccess<'static>>(version, "login-success")?;
     let login_disconnect_id =
@@ -40,8 +36,50 @@ pub(super) async fn relay_login_handoff(
     let config_finish_serverbound_id =
         packet_id_for_version::<SAcknowledgeFinishConfig>(version, "config-finish-serverbound")?;
 
-    let mut phase = Phase::Login;
     let mut player_name: Option<String> = None;
+    let mut login_success_forwarded = false;
+
+    loop {
+        tokio::select! {
+            backend_packet = read_packet(backend) => {
+                let backend_packet = backend_packet?;
+                let backend_id = packet_id(&backend_packet)?;
+
+                if backend_id == login_success_id {
+                    let core = parse_backend_login_success(&backend_packet)?;
+                    let strict_error_handling = strict_error_handling(protocol_version);
+                    let rebuilt = build_login_success_packet(&core, version, strict_error_handling)?;
+                    write_framed_payload(client, rebuilt.as_slice()).await?;
+
+                    player_name = Some(core.username.clone());
+                    login_success_forwarded = true;
+                    log_info!("Configuration transition armed (state=3) for {}", core.username);
+                    continue;
+                }
+
+                write_framed_payload(client, &backend_packet).await?;
+
+                if backend_id == login_disconnect_id {
+                    return Ok(None);
+                }
+            }
+
+            client_packet = read_packet(client) => {
+                let client_packet = client_packet?;
+                let client_id = packet_id(&client_packet)?;
+                write_framed_payload(backend, &client_packet).await?;
+
+                if login_success_forwarded && client_id == login_ack_id {
+                    log_info!(
+                        "Client {} acknowledged login; entering configuration relay",
+                        player_name.as_deref().unwrap_or(fallback_username)
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     let mut backend_sent_finish_config = false;
     let mut client_sent_finish_config = false;
 
@@ -51,27 +89,13 @@ pub(super) async fn relay_login_handoff(
                 let backend_packet = backend_packet?;
                 let backend_id = packet_id(&backend_packet)?;
 
-                if matches!(phase, Phase::Login) && backend_id == login_success_id {
-                    let core = parse_backend_login_success(&backend_packet)?;
-                    let strict_error_handling = strict_error_handling(protocol_version);
-                    let rebuilt = build_login_success_packet(&core, version, strict_error_handling)?;
-                    write_framed_payload(client, rebuilt.as_slice()).await?;
-
-                    player_name = Some(core.username.clone());
-                    log_info!("Configuration transition armed (state=3) for {}", core.username);
-                    continue;
-                }
-
+                // Transparent configuration relay: forward all backend packets as-is.
                 write_framed_payload(client, &backend_packet).await?;
 
-                if matches!(phase, Phase::Login) && backend_id == login_disconnect_id {
-                    return Ok(None);
-                }
-
-                if matches!(phase, Phase::Config) && backend_id == config_finish_clientbound_id {
+                if backend_id == config_finish_clientbound_id {
                     backend_sent_finish_config = true;
                     if client_sent_finish_config {
-                        return Ok(Some(player_name.unwrap_or_else(|| fallback_username.to_owned())));
+                        break;
                     }
                 }
             }
@@ -79,30 +103,26 @@ pub(super) async fn relay_login_handoff(
             client_packet = read_packet(client) => {
                 let client_packet = client_packet?;
                 let client_id = packet_id(&client_packet)?;
+
+                // Transparent configuration relay: forward all client packets as-is.
                 write_framed_payload(backend, &client_packet).await?;
 
-                match phase {
-                    Phase::Login => {
-                        if client_id == login_ack_id && player_name.is_some() {
-                            phase = Phase::Config;
-                            log_info!(
-                                "Client {} acknowledged login; entering configuration relay",
-                                player_name.as_deref().unwrap_or(fallback_username)
-                            );
-                        }
-                    }
-                    Phase::Config => {
-                        if client_id == config_finish_serverbound_id {
-                            client_sent_finish_config = true;
-                            if backend_sent_finish_config {
-                                return Ok(Some(player_name.unwrap_or_else(|| fallback_username.to_owned())));
-                            }
-                        }
+                if client_id == config_finish_serverbound_id {
+                    client_sent_finish_config = true;
+                    if backend_sent_finish_config {
+                        break;
                     }
                 }
             }
         }
     }
+
+    client.flush().await?;
+    backend.flush().await?;
+
+    Ok(Some(
+        player_name.unwrap_or_else(|| fallback_username.to_owned()),
+    ))
 }
 
 fn parse_backend_login_success(packet: &[u8]) -> std::io::Result<LoginSuccessCore> {
