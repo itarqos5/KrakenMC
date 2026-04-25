@@ -1,12 +1,12 @@
 use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::io::Write;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use uuid::Uuid;
 
 use crate::WorldDb;
+use crate::logger::{log_error, log_warn};
 
 #[derive(Component, Serialize, Deserialize, Clone, Debug)]
 pub struct Position {
@@ -75,6 +75,8 @@ pub fn handle_disconnect(
     ), With<Disconnected>>,
     db: Res<WorldDb>,
 ) {
+    let mut wrote_any = false;
+
     for (entity, uuid, pos, hp, xp, inv, sat) in query.iter() {
         let save_data = PlayerSaveData {
             position: pos.clone(),
@@ -91,17 +93,25 @@ pub fn handle_disconnect(
             if encoder.write_all(&serialized).is_ok() {
                 if let Ok(compressed) = encoder.finish() {
                     let key = format!("player:{}", uuid.0);
-                    let _ = db.0.insert(key.as_bytes(), compressed);
+                    match db.0.insert(key.as_bytes(), compressed) {
+                        Ok(_) => wrote_any = true,
+                        Err(e) => log_error!("Failed to persist disconnected player {}: {}", uuid.0, e),
+                    }
                 }
             }
         }
         
         commands.entity(entity).despawn();
     }
+
+    if wrote_any {
+        if let Err(e) = db.0.flush() {
+            log_warn!("Failed to flush disconnected player persistence batch: {}", e);
+        }
+    }
 }
 
 pub fn handle_chat_and_commands() {
-    // Keep function available but no explicit params so compilation succeeds
 }
 
 pub fn handle_chunk_request() {

@@ -28,36 +28,19 @@ pub struct ViaKrakenPlugin {
 
 impl Plugin for ViaKrakenPlugin {
     fn build(&self, _app: &mut bevy_app::App) {
-        let backend_config = self.config.clone();
+        let runtime_config = self.config.clone();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    log_error!("Failed to create backend runtime: {}", e);
-                    return;
-                }
-            };
-
-            runtime.block_on(async move {
-                if let Err(e) = run_backend_listener(backend_config).await {
-                    log_error!("Backend listener stopped: {}", e);
-                }
-            });
-        });
-
-        let proxy_config = self.config.clone();
-        std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log_error!("Failed to create proxy runtime: {}", e);
+                    log_error!("Failed to create ViaKraken runtime: {}", e);
                     return;
                 }
             };
 
             runtime.block_on(async move {
                 let vk = ViaKraken {
-                    config: proxy_config,
+                    config: runtime_config,
                 };
                 vk.start().await;
             });
@@ -71,23 +54,53 @@ pub struct ViaKraken {
 
 impl ViaKraken {
     pub async fn start(&self) {
-        let proxy_addr = format!("0.0.0.0:{}", self.config.server_port);
-        let listener = match TcpListener::bind(&proxy_addr).await {
-            Ok(listener) => listener,
+        let (backend_listener, backend_port) = match bind_with_port_bump(
+            "0.0.0.0",
+            self.config.server_port.saturating_add(1),
+            "backend",
+        )
+        .await
+        {
+            Ok(binding) => binding,
             Err(e) => {
-                log_error!("Failed to bind proxy listener on {}: {}", proxy_addr, e);
+                log_error!("Failed to bind backend listener: {}", e);
                 return;
             }
         };
 
-        log_info!("ViaKraken proxy listening on {}", proxy_addr);
+        let (proxy_listener, proxy_port) = match bind_with_port_bump(
+            "0.0.0.0",
+            self.config.server_port,
+            "proxy",
+        )
+        .await
+        {
+            Ok(binding) => binding,
+            Err(e) => {
+                log_error!("Failed to bind proxy listener: {}", e);
+                return;
+            }
+        };
+
+        log_info!(
+            "ViaKraken active: proxy=0.0.0.0:{} backend=0.0.0.0:{}",
+            proxy_port,
+            backend_port
+        );
+
+        let backend_config = self.config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_backend_listener(backend_listener, backend_config, backend_port).await {
+                log_error!("Backend listener stopped: {}", e);
+            }
+        });
 
         loop {
-            match listener.accept().await {
+            match proxy_listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     let config = self.config.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = proxy::handle_connection(stream, peer_addr, config).await {
+                        if let Err(e) = proxy::handle_connection(stream, peer_addr, config, backend_port).await {
                             log_error!("Proxy connection {} failed: {}", peer_addr, e);
                         }
                     });
@@ -100,9 +113,51 @@ impl ViaKraken {
     }
 }
 
-async fn run_backend_listener(config: Arc<ServerConfig>) -> std::io::Result<()> {
-    let backend_addr = format!("0.0.0.0:{}", config.server_port + 1);
-    let listener = TcpListener::bind(&backend_addr).await?;
+async fn bind_with_port_bump(host: &str, start_port: u16, label: &str) -> std::io::Result<(TcpListener, u16)> {
+    let mut port = start_port;
+    let mut last_addr_in_use: Option<Error> = None;
+
+    for attempt in 1..=10 {
+        match TcpListener::bind((host, port)).await {
+            Ok(listener) => {
+                if attempt > 1 {
+                    log_warn!(
+                        "{} listener recovered on attempt {}/10 at {}:{}",
+                        label,
+                        attempt,
+                        host,
+                        port
+                    );
+                }
+                return Ok((listener, port));
+            }
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                log_warn!(
+                    "{} listener port {} in use (attempt {}/10); trying {}",
+                    label,
+                    port,
+                    attempt,
+                    port.saturating_add(1)
+                );
+                last_addr_in_use = Some(e);
+                port = port.saturating_add(1);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if let Some(e) = last_addr_in_use {
+        Err(e)
+    } else {
+        Err(Error::new(
+            ErrorKind::AddrInUse,
+            format!("{} listener failed to bind after 10 attempts", label),
+        ))
+    }
+}
+
+async fn run_backend_listener(listener: TcpListener, config: Arc<ServerConfig>, backend_port: u16) -> std::io::Result<()> {
+    let backend_addr = format!("0.0.0.0:{}", backend_port);
 
     log_info!(
         "Kraken backend listening on {} (compression threshold={})",
@@ -218,18 +273,32 @@ async fn handle_login(
     let mut brand_data = Vec::new();
     write_string(&mut brand_data, brand)?;
 
-    let mut custom_payload = Vec::new();
-    write_string(&mut custom_payload, "minecraft:brand")?;
-    custom_payload.extend_from_slice(&brand_data);
-    write_packet(stream, 0x01, &custom_payload).await?;
-
     let mut known_packs_payload = Vec::new();
     write_varint(&mut known_packs_payload, 0);
     write_packet(stream, 0x0E, &known_packs_payload).await?;
 
     write_packet(stream, 0x03, &[]).await?;
 
-    let _ = timeout(Duration::from_secs(15), read_packet(stream)).await;
+    let mut entered_play = false;
+    if let Ok(Ok(config_finish_packet)) = timeout(Duration::from_secs(15), read_packet(stream)).await {
+        let mut finish_offset = 0usize;
+        let finish_id = read_varint_from_slice(&config_finish_packet, &mut finish_offset)?;
+        if finish_id == 0x03 {
+            entered_play = true;
+        }
+    }
+
+    if entered_play {
+        let mut play_brand_payload = Vec::new();
+        write_string(&mut play_brand_payload, "minecraft:brand")?;
+        play_brand_payload.extend_from_slice(&brand_data);
+        write_packet(stream, 0x18, &play_brand_payload).await?;
+    } else {
+        log_warn!(
+            "Did not receive config-finish from {}; play-state brand injection skipped",
+            username
+        );
+    }
 
     log_info!(
         "Login flow completed for {} (protocol={}, max_players={})",

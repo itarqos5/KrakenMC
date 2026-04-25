@@ -20,6 +20,11 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 #[derive(Resource, Clone)]
 pub struct WorldDb(pub Arc<sled::Db>);
 
+fn is_lock_like_sled_error(err: &sled::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("acquire lock") || msg.contains("locked") || msg.contains("os { code: 33")
+}
+
 fn open_world_db() -> Arc<sled::Db> {
     let primary_path = "world_data";
     let mut last_err: Option<sled::Error> = None;
@@ -37,12 +42,21 @@ fn open_world_db() -> Arc<sled::Db> {
                 return Arc::new(db);
             }
             Err(err) => {
+                let lock_like = is_lock_like_sled_error(&err);
                 last_err = Some(err);
-                logger::log_warn!(
-                    "Sled DB open failed (attempt {}/5) at {}. Retrying...",
-                    attempt,
-                    primary_path
-                );
+                if lock_like {
+                    logger::log_warn!(
+                        "Sled lock contention detected at {} (attempt {}/5). Stale lock suspected; retrying.",
+                        primary_path,
+                        attempt
+                    );
+                } else {
+                    logger::log_warn!(
+                        "Sled DB open failed (attempt {}/5) at {}. Retrying...",
+                        attempt,
+                        primary_path
+                    );
+                }
                 std::thread::sleep(std::time::Duration::from_millis(300));
             }
         }

@@ -19,7 +19,8 @@ struct HandshakeInfo {
 pub async fn handle_connection(
     mut client: TcpStream,
     peer_addr: std::net::SocketAddr,
-    config: Arc<ServerConfig>,
+    _config: Arc<ServerConfig>,
+    backend_port: u16,
 ) -> std::io::Result<()> {
     let first_packet = read_packet(&mut client).await?;
     let handshake = parse_handshake(&first_packet)?;
@@ -49,14 +50,14 @@ pub async fn handle_connection(
             "Native route {} protocol {} -> backend {}",
             peer_addr,
             handshake.protocol_version,
-            config.server_port + 1
+            backend_port
         );
     } else if (766..=775).contains(&handshake.protocol_version) {
         log_info!(
             "ViaKraken route {} protocol {} -> backend {}",
             peer_addr,
             handshake.protocol_version,
-            config.server_port + 1
+            backend_port
         );
     } else if handshake.next_state == 2 {
         let reason = format!(
@@ -72,7 +73,7 @@ pub async fn handle_connection(
         return Ok(());
     }
 
-    let mut backend = match TcpStream::connect(("127.0.0.1", config.server_port + 1)).await {
+    let mut backend = match TcpStream::connect(("127.0.0.1", backend_port)).await {
         Ok(stream) => stream,
         Err(e) => {
             log_error!(
