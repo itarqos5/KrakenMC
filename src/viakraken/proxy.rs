@@ -1,187 +1,270 @@
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
 use crate::config::ServerConfig;
 use crate::logger::{log_error, log_info, log_warn};
 
+const NATIVE_PROTOCOL: i32 = 776;
+const MAX_PACKET_LEN: i32 = 2_097_152;
+
+#[derive(Debug, Clone)]
+struct HandshakeInfo {
+    protocol_version: i32,
+    next_state: i32,
+}
+
 pub async fn handle_connection(
-    mut stream: tokio::net::TcpStream,
+    mut client: TcpStream,
     peer_addr: std::net::SocketAddr,
     config: Arc<ServerConfig>,
 ) -> std::io::Result<()> {
-    let target_protocol = config.target_protocol;
-    let backend_port = config.server_port + 1;
+    let first_packet = read_packet(&mut client).await?;
+    let handshake = parse_handshake(&first_packet)?;
 
-    let mut buf = bytes::BytesMut::with_capacity(512);
-    buf.resize(256, 0); // Temporary fill
-    let n = stream.peek(&mut buf).await?;
-    if n == 0 {
+    if handshake.next_state != 1 && handshake.next_state != 2 {
+        log_warn!(
+            "Rejected {} with invalid handshake next_state {}",
+            peer_addr,
+            handshake.next_state
+        );
         return Ok(());
     }
 
-    let read_varint = |offset: &mut usize| -> Option<i32> {
-        let mut value = 0;
-        let mut position = 0;
-        loop {
-            if *offset >= n { return None; }
-            let current_byte = buf[*offset];
-            *offset += 1;
-            value |= ((current_byte & 0x7F) as i32) << position;
-            if (current_byte & 0x80) == 0 { break; }
-            position += 7;
-            if position >= 32 { return None; }
+    if handshake.next_state == 2 && handshake.protocol_version == 763 {
+        let reason = r#"{"text":"Kraken does not support protocol 763 (1.20.1)."}"#;
+        send_login_disconnect(&mut client, reason).await?;
+        log_warn!(
+            "Rejected {} due to unsupported protocol {}",
+            peer_addr,
+            handshake.protocol_version
+        );
+        return Ok(());
+    }
+
+    if handshake.protocol_version == NATIVE_PROTOCOL {
+        log_info!(
+            "Native route {} protocol {} -> backend {}",
+            peer_addr,
+            handshake.protocol_version,
+            config.server_port + 1
+        );
+    } else if (766..=775).contains(&handshake.protocol_version) {
+        log_info!(
+            "ViaKraken route {} protocol {} -> backend {}",
+            peer_addr,
+            handshake.protocol_version,
+            config.server_port + 1
+        );
+    } else if handshake.next_state == 2 {
+        let reason = format!(
+            r#"{{"text":"Kraken supports login protocol 766..=776. You sent {}."}}"#,
+            handshake.protocol_version
+        );
+        send_login_disconnect(&mut client, &reason).await?;
+        log_warn!(
+            "Rejected {} unsupported login protocol {}",
+            peer_addr,
+            handshake.protocol_version
+        );
+        return Ok(());
+    }
+
+    let mut backend = match TcpStream::connect(("127.0.0.1", config.server_port + 1)).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            log_error!(
+                "Failed to connect proxy backend for {}: {}",
+                peer_addr,
+                e
+            );
+            return Ok(());
         }
-        Some(value)
     };
 
-    let mut protocol = 0;
-    let mut old_protocol_len = 0;
-    let mut protocol_offset = 0;
-    let mut packet_len = 0;
-    let mut packet_len_offset = 0;
-    let mut next_state = 0;
+    write_framed_payload(&mut backend, &first_packet).await?;
 
-    let mut offset = 0;
-    if let Some(len) = read_varint(&mut offset) {
-        packet_len = len;
-        packet_len_offset = offset;
-        let _id_offset = offset;
-        if let Some(id) = read_varint(&mut offset) {
-            if id == 0 {
-                protocol_offset = offset;
-                if let Some(ver) = read_varint(&mut offset) {
-                    protocol = ver;
-                    old_protocol_len = offset - protocol_offset;
-                    if let Some(str_len) = read_varint(&mut offset) {
-                        offset += str_len as usize;
-                        offset += 2;
-                        if let Some(s) = read_varint(&mut offset) {
-                            next_state = s;
-                        }
-                    }
-                }
-            } else if id == 254 {
-                protocol = -1;
-            }
-        }
-    }
-
-    let total_handshake_bytes = packet_len_offset + packet_len as usize;
-    let mut handshake_data = vec![0u8; total_handshake_bytes];
-    if protocol > 0 {
-        use tokio::io::AsyncReadExt;
-        stream.read_exact(&mut handshake_data).await?;
-        
-        log_warn!("Detected connection from {} with protocol {}", peer_addr, protocol);
-        
-        if protocol == 763 {
-            log_warn!("Rejected connection from {} (Protocol 763 lacks Configuration state support)", peer_addr);
-            return Ok(());
-        }
-
-        let is_1_21_11 = protocol == 776;
-        let is_rewritable = (766..=775).contains(&protocol);
-        let supported = is_1_21_11 || is_rewritable;
-
-        if !supported {
-            if next_state == 2 {
-                let reason = format!(r#"{{"text":"Kraken requires 1.20.5 - 1.21.11. Protocol {} unsupported."}}"#, protocol);
-                
-                let mut reason_data = vec![];
-                reason_data.push(0x00);
-                
-                let mut val = reason.len() as u32;
-                loop {
-                    let mut temp = (val & 0b01111111) as u8;
-                    val >>= 7;
-                    if val != 0 { temp |= 0b10000000; }
-                    reason_data.push(temp);
-                    if val == 0 { break; }
-                }
-                reason_data.extend_from_slice(reason.as_bytes());
-
-                let mut final_pkt = vec![];
-                let mut val = reason_data.len() as u32;
-                loop {
-                    let mut temp = (val & 0b01111111) as u8;
-                    val >>= 7;
-                    if val != 0 { temp |= 0b10000000; }
-                    final_pkt.push(temp);
-                    if val == 0 { break; }
-                }
-                final_pkt.extend_from_slice(&reason_data);
-
-                use tokio::io::AsyncWriteExt;
-                let _ = stream.write_all(&final_pkt).await;
-                let _ = stream.shutdown().await;
-            }
-            log_warn!("Rejected connection from {} (Unsupported Protocol: {})", peer_addr, protocol);
-            return Ok(());
-        }
-            
-        if !is_1_21_11 && is_rewritable {
+    match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
+        Ok((to_backend, to_client)) => {
             log_info!(
-                "ViaKraken starting translation stream for {} -> {}",
-                protocol,
-                target_protocol
+                "Bridge closed for {} (to_backend={} bytes, to_client={} bytes)",
+                peer_addr,
+                to_backend,
+                to_client
             );
-            
-            let mut new_prot_bytes = vec![];
-            let mut val = target_protocol as u32;
-            loop {
-                let mut temp = (val & 0b01111111) as u8;
-                val >>= 7;
-                if val != 0 { temp |= 0b10000000; }
-                new_prot_bytes.push(temp);
-                if val == 0 { break; }
-            }
-
-            let id_bytes = &handshake_data[packet_len_offset..protocol_offset];
-            let rest_of_packet = &handshake_data[(protocol_offset + old_protocol_len)..];
-            
-            let mut new_payload = vec![];
-            new_payload.extend_from_slice(id_bytes);
-            new_payload.extend_from_slice(&new_prot_bytes);
-            new_payload.extend_from_slice(rest_of_packet);
-
-            let mut new_len_bytes = vec![];
-            let mut val = new_payload.len() as u32;
-            loop {
-                let mut temp = (val & 0b01111111) as u8;
-                val >>= 7;
-                if val != 0 { temp |= 0b10000000; }
-                new_len_bytes.push(temp);
-                if val == 0 { break; }
-            }
-
-            handshake_data = vec![];
-            handshake_data.extend_from_slice(&new_len_bytes);
-            handshake_data.extend_from_slice(&new_payload);
-        }
-    }
-
-    match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", backend_port)).await {
-        Ok(mut backend) => {
-            use tokio::io::AsyncWriteExt;
-            if protocol > 0 {
-                backend.write_all(&handshake_data).await?;
-            }
-            match tokio::io::copy_bidirectional(&mut stream, &mut backend).await {
-                Ok((to_client, to_server)) => {
-                    let total_kib = (to_client + to_server) / 1024;
-                    log_info!(
-                        "Connection {} closed. Session transferred {} KiB",
-                        peer_addr,
-                        total_kib
-                    );
-                }
-                Err(e) => {
-                    log_warn!("Proxy connection {} closed unexpectedly: {}", peer_addr, e);
-                }
-            }
         }
         Err(e) => {
-            log_error!("Could not proxy {} to backend: {}", peer_addr, e);
+            log_warn!("Bridge terminated for {}: {}", peer_addr, e);
         }
     }
 
     Ok(())
+}
+
+async fn send_login_disconnect(stream: &mut TcpStream, json_reason: &str) -> std::io::Result<()> {
+    let mut payload = Vec::new();
+    write_string(&mut payload, json_reason)?;
+    write_packet(stream, 0x00, &payload).await
+}
+
+fn parse_handshake(payload: &[u8]) -> std::io::Result<HandshakeInfo> {
+    let mut offset = 0usize;
+    let packet_id = read_varint_from_slice(payload, &mut offset)?;
+    if packet_id != 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "first packet was not handshake",
+        ));
+    }
+
+    let protocol_version = read_varint_from_slice(payload, &mut offset)?;
+    let _server_addr = read_string_from_slice(payload, &mut offset)?;
+
+    if offset + 2 > payload.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "missing handshake port",
+        ));
+    }
+    offset += 2;
+
+    let next_state = read_varint_from_slice(payload, &mut offset)?;
+
+    Ok(HandshakeInfo {
+        protocol_version,
+        next_state,
+    })
+}
+
+fn write_varint(buf: &mut Vec<u8>, value: i32) {
+    let mut val = value as u32;
+    loop {
+        if (val & !0x7F) == 0 {
+            buf.push(val as u8);
+            break;
+        }
+        buf.push(((val & 0x7F) as u8) | 0x80);
+        val >>= 7;
+    }
+}
+
+fn read_varint_from_slice(data: &[u8], offset: &mut usize) -> std::io::Result<i32> {
+    let mut num_read = 0;
+    let mut result: i32 = 0;
+
+    loop {
+        if *offset >= data.len() {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "unexpected eof while reading varint",
+            ));
+        }
+
+        let read = data[*offset];
+        *offset += 1;
+
+        let value = (read & 0x7F) as i32;
+        result |= value << (7 * num_read);
+
+        num_read += 1;
+        if num_read > 5 {
+            return Err(Error::new(ErrorKind::InvalidData, "varint too big"));
+        }
+
+        if (read & 0x80) == 0 {
+            break;
+        }
+    }
+
+    Ok(result)
+}
+
+async fn read_varint(stream: &mut TcpStream) -> std::io::Result<i32> {
+    let mut num_read = 0;
+    let mut result: i32 = 0;
+
+    loop {
+        let mut one = [0u8; 1];
+        stream.read_exact(&mut one).await?;
+
+        let value = (one[0] & 0x7F) as i32;
+        result |= value << (7 * num_read);
+
+        num_read += 1;
+        if num_read > 5 {
+            return Err(Error::new(ErrorKind::InvalidData, "varint too big"));
+        }
+
+        if (one[0] & 0x80) == 0 {
+            break;
+        }
+    }
+
+    Ok(result)
+}
+
+fn read_string_from_slice(data: &[u8], offset: &mut usize) -> std::io::Result<String> {
+    let len = read_varint_from_slice(data, offset)?;
+    if len < 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "negative string length",
+        ));
+    }
+
+    let len = len as usize;
+    if *offset + len > data.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "not enough bytes for string",
+        ));
+    }
+
+    let value = std::str::from_utf8(&data[*offset..*offset + len])
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid utf8 in string"))?
+        .to_owned();
+
+    *offset += len;
+    Ok(value)
+}
+
+fn write_string(buf: &mut Vec<u8>, value: &str) -> std::io::Result<()> {
+    let bytes = value.as_bytes();
+    if bytes.len() > i32::MAX as usize {
+        return Err(Error::new(ErrorKind::InvalidInput, "string too long"));
+    }
+    write_varint(buf, bytes.len() as i32);
+    buf.extend_from_slice(bytes);
+    Ok(())
+}
+
+async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let packet_len = read_varint(stream).await?;
+    if !(0..=MAX_PACKET_LEN).contains(&packet_len) {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid packet length"));
+    }
+
+    let mut payload = vec![0u8; packet_len as usize];
+    stream.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+async fn write_framed_payload(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    if payload.len() > MAX_PACKET_LEN as usize {
+        return Err(Error::new(ErrorKind::InvalidInput, "payload too large"));
+    }
+    let mut len_buf = Vec::with_capacity(5);
+    write_varint(&mut len_buf, payload.len() as i32);
+    stream.write_all(&len_buf).await?;
+    stream.write_all(payload).await?;
+    Ok(())
+}
+
+async fn write_packet(stream: &mut TcpStream, packet_id: i32, payload: &[u8]) -> std::io::Result<()> {
+    let mut packet = Vec::with_capacity(8 + payload.len());
+    write_varint(&mut packet, packet_id);
+    packet.extend_from_slice(payload);
+    write_framed_payload(stream, &packet).await
 }
