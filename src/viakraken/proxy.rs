@@ -77,6 +77,13 @@ pub async fn handle_connection(
     let mut backend = match TcpStream::connect(("127.0.0.1", backend_port)).await {
         Ok(stream) => stream,
         Err(e) => {
+            if handshake.next_state == 2 {
+                let reason = format!(
+                    r#"{{"text":"Kraken backend is unavailable on port {}. Please retry in a few seconds."}}"#,
+                    backend_port
+                );
+                let _ = send_login_disconnect(&mut client, &reason).await;
+            }
             log_error!(
                 "Failed to connect proxy backend for {}: {}",
                 peer_addr,
@@ -93,7 +100,12 @@ pub async fn handle_connection(
         return Ok(());
     }
 
-    relay_login_and_configuration(&mut client, &mut backend, handshake.protocol_version).await?;
+    let normalized_login_success = match relay_login_handoff(&mut client, &mut backend).await? {
+        Some(packet) => packet,
+        None => return Ok(()),
+    };
+
+    write_framed_payload(&mut client, &normalized_login_success).await?;
 
     match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
         Ok((to_backend, to_client)) => {
@@ -128,69 +140,34 @@ async fn relay_status_exchange(client: &mut TcpStream, backend: &mut TcpStream) 
     Ok(())
 }
 
-async fn relay_login_and_configuration(
+async fn relay_login_handoff(
     client: &mut TcpStream,
     backend: &mut TcpStream,
-    protocol_version: i32,
-) -> std::io::Result<()> {
-    enum Phase {
-        Login,
-        Configuration,
-        PlayPendingBrand,
-    }
-
-    let brand = if protocol_version == NATIVE_PROTOCOL {
-        "Kraken"
-    } else {
-        "Kraken (ViaKraken)"
-    };
-
-    let mut phase = Phase::Login;
-
+) -> std::io::Result<Option<Vec<u8>>> {
     loop {
         tokio::select! {
-            client_packet = read_packet(client) => {
-                let client_packet = client_packet?;
-                let client_id = packet_id(&client_packet)?;
-
-                if matches!(phase, Phase::Login) && client_id == 0x03 {
-                    phase = Phase::Configuration;
-                } else if matches!(phase, Phase::Configuration) && client_id == 0x03 {
-                    phase = Phase::PlayPendingBrand;
-                }
-
-                write_framed_payload(backend, &client_packet).await?;
-            }
-
             backend_packet = read_packet(backend) => {
                 let backend_packet = backend_packet?;
                 let backend_id = packet_id(&backend_packet)?;
 
-                if matches!(phase, Phase::Configuration) && (backend_id == 0x07 || backend_id == 0x05) {
-                    log_info!("Relaying configuration registry_data packet id=0x{backend_id:02x}");
-                }
-
-                if matches!(phase, Phase::Login) && backend_id == 0x02 {
+                if backend_id == 0x02 {
                     let normalized = normalize_login_success(&backend_packet)?;
-                    write_framed_payload(client, &normalized).await?;
-                } else {
-                    write_framed_payload(client, &backend_packet).await?;
+                    return Ok(Some(normalized));
                 }
 
-                if matches!(phase, Phase::PlayPendingBrand) {
-                    inject_play_brand(client, brand).await?;
-                    return Ok(());
+                write_framed_payload(client, &backend_packet).await?;
+
+                if backend_id == 0x00 {
+                    return Ok(None);
                 }
+            }
+
+            client_packet = read_packet(client) => {
+                let client_packet = client_packet?;
+                write_framed_payload(backend, &client_packet).await?;
             }
         }
     }
-}
-
-async fn inject_play_brand(client: &mut TcpStream, brand: &str) -> std::io::Result<()> {
-    let mut payload = Vec::new();
-    write_string(&mut payload, "minecraft:brand")?;
-    write_string(&mut payload, brand)?;
-    write_packet(client, 0x18, &payload).await
 }
 
 fn normalize_login_success(packet: &[u8]) -> std::io::Result<Vec<u8>> {
