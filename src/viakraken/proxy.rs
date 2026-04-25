@@ -22,6 +22,12 @@ struct LoginStartInfo {
     username: String,
 }
 
+#[derive(Debug, Clone)]
+struct LoginSuccessCore {
+    uuid: [u8; 16],
+    username: String,
+}
+
 pub async fn handle_connection(
     mut client: TcpStream,
     peer_addr: std::net::SocketAddr,
@@ -106,7 +112,17 @@ pub async fn handle_connection(
     }
 
     let login_start = read_login_start_and_forward(&mut client, &mut backend).await?;
-    let player = login_start.username;
+    let player = match relay_login_handoff(
+        &mut client,
+        &mut backend,
+        handshake.protocol_version,
+        &login_start.username,
+    )
+    .await?
+    {
+        Some(player_name) => player_name,
+        None => return Ok(()),
+    };
 
     if let Err(e) = client.set_nodelay(true) {
         log_warn!("Failed to set TCP_NODELAY for client {}: {}", peer_addr, e);
@@ -173,6 +189,108 @@ async fn read_login_start_and_forward(
     write_framed_payload(backend, &login_start).await?;
 
     Ok(LoginStartInfo { username })
+}
+
+async fn relay_login_handoff(
+    client: &mut TcpStream,
+    backend: &mut TcpStream,
+    protocol_version: i32,
+    fallback_username: &str,
+) -> std::io::Result<Option<String>> {
+    loop {
+        tokio::select! {
+            backend_packet = read_packet(backend) => {
+                let backend_packet = backend_packet?;
+                let backend_id = packet_id(&backend_packet)?;
+
+                if backend_id == 0x02 {
+                    if protocol_version == NATIVE_PROTOCOL {
+                        let core = parse_login_success_core_776(&backend_packet)?;
+                        let rebuilt = build_login_success_776(&core)?;
+                        write_framed_payload(client, &rebuilt).await?;
+                        return Ok(Some(core.username));
+                    }
+
+                    write_framed_payload(client, &backend_packet).await?;
+                    return Ok(Some(fallback_username.to_owned()));
+                }
+
+                write_framed_payload(client, &backend_packet).await?;
+                if backend_id == 0x00 {
+                    return Ok(None);
+                }
+            }
+
+            client_packet = read_packet(client) => {
+                let client_packet = client_packet?;
+                write_framed_payload(backend, &client_packet).await?;
+            }
+        }
+    }
+}
+
+fn parse_login_success_core_776(packet: &[u8]) -> std::io::Result<LoginSuccessCore> {
+    let mut offset = 0usize;
+    let id = read_varint_from_slice(packet, &mut offset)?;
+    if id != 0x02 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("expected login success packet id 0x02, got 0x{id:02x}"),
+        ));
+    }
+
+    if offset + 16 > packet.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "login success missing 16-byte UUID",
+        ));
+    }
+
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&packet[offset..offset + 16]);
+    offset += 16;
+
+    let username = read_string_from_slice(packet, &mut offset)?;
+    let properties_count = read_varint_from_slice(packet, &mut offset)?;
+    if properties_count < 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "login success properties count cannot be negative",
+        ));
+    }
+
+    for _ in 0..properties_count {
+        let _name = read_string_from_slice(packet, &mut offset)?;
+        let _value = read_string_from_slice(packet, &mut offset)?;
+        let is_signed = read_bool_from_slice(packet, &mut offset)?;
+        if is_signed {
+            let _signature = read_string_from_slice(packet, &mut offset)?;
+        }
+    }
+
+    let _strict_error_handling = read_bool_from_slice(packet, &mut offset)?;
+
+    if offset != packet.len() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "login success has {} trailing bytes after strictErrorHandling",
+                packet.len() - offset
+            ),
+        ));
+    }
+
+    Ok(LoginSuccessCore { uuid, username })
+}
+
+fn build_login_success_776(core: &LoginSuccessCore) -> std::io::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    write_varint(&mut payload, 0x02);
+    payload.extend_from_slice(&core.uuid);
+    write_string(&mut payload, &core.username)?;
+    write_varint(&mut payload, 0);
+    payload.push(0x00);
+    Ok(payload)
 }
 
 fn parse_login_start_username(packet: &[u8]) -> std::io::Result<String> {
@@ -380,4 +498,30 @@ async fn write_packet(stream: &mut TcpStream, packet_id: i32, payload: &[u8]) ->
     write_varint(&mut packet, packet_id);
     packet.extend_from_slice(payload);
     write_framed_payload(stream, &packet).await
+}
+
+fn packet_id(packet: &[u8]) -> std::io::Result<i32> {
+    let mut offset = 0usize;
+    read_varint_from_slice(packet, &mut offset)
+}
+
+fn read_bool_from_slice(data: &[u8], offset: &mut usize) -> std::io::Result<bool> {
+    if *offset >= data.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "unexpected eof while reading bool",
+        ));
+    }
+
+    let value = data[*offset];
+    *offset += 1;
+
+    match value {
+        0x00 => Ok(false),
+        0x01 => Ok(true),
+        _ => Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid boolean byte 0x{value:02x}"),
+        )),
+    }
 }
