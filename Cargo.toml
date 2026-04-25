@@ -5,9 +5,6 @@ edition = "2021"
 description = "High-performance Minecraft server"
 
 [dependencies]
-# Pointing to the 1.21 work branch
-valence = { git = "https://github.com/valence-rs/valence", branch = "next-1.21" }
-valence_command = { git = "https://github.com/valence-rs/valence", branch = "next-1.21" }
 mimalloc = "0.1"
 noise = "0.9"
 flume = "0.11"
@@ -25,6 +22,17 @@ flate2 = "1.1.9"
 serde = { version = "1.0.228", features = ["derive"] }
 rand = "0.10.1"
 ctrlc = "3.5.2"
+azalea = "0.16.0"
+azalea-protocol = "0.16.0"
+azalea-client = "0.16.0"
+azalea-world = "0.16.0"
+azalea-entity = "0.16.0"
+azalea-core = "0.16.0"
+azalea-inventory = "0.16.0"
+azalea-block = "0.16.0"
+bevy_app = "0.18.1"
+bevy_ecs = "0.18.1"
+uuid = { version = "1.23.1", features = ["v4"] }
 
 [profile.release]
 lto = true
