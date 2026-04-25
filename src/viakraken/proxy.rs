@@ -71,11 +71,19 @@ pub async fn handle_connection(
         stream.read_exact(&mut handshake_data).await?;
         
         log_warn!("Detected connection from {} with protocol {}", peer_addr, protocol);
-        // Accepted: backend target directly, or versions we can attempt to rewrite.
-        let supported = protocol == target_protocol || (764..=776).contains(&protocol);
+        
+        if protocol == 763 {
+            log_warn!("Rejected connection from {} (Protocol 763 lacks Configuration state support)", peer_addr);
+            return Ok(());
+        }
+
+        let is_1_21_11 = protocol == 776;
+        let is_rewritable = (766..=775).contains(&protocol);
+        let supported = is_1_21_11 || is_rewritable;
+
         if !supported {
             if next_state == 2 {
-                let reason = format!(r#"{{"text":"Kraken requires 1.20.2 - 1.21.11. Please upgrade your client."}}"#);
+                let reason = format!(r#"{{"text":"Kraken requires 1.20.5 - 1.21.11. Protocol {} unsupported."}}"#, protocol);
                 
                 let mut reason_data = vec![];
                 reason_data.push(0x00);
@@ -109,7 +117,7 @@ pub async fn handle_connection(
             return Ok(());
         }
             
-        if protocol != target_protocol {
+        if !is_1_21_11 && is_rewritable {
             log_info!(
                 "ViaKraken starting translation stream for {} -> {}",
                 protocol,

@@ -31,7 +31,7 @@ impl ViaKraken {
     pub async fn start(&self) {
         log_info!("Loading ViaKraken...");
         
-        let addr = format!("{}:{}", self.config.server_ip, self.config.server_port);
+        let addr = format!("0.0.0.0:{}", self.config.server_port);
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {

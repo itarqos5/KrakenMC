@@ -14,7 +14,6 @@ mod viakraken;
 mod world;
 mod systems;
 mod handlers;
-mod packet;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -22,13 +21,21 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 pub struct WorldDb(pub Arc<sled::Db>);
 
 fn main() {
+    owo_colors::set_override(true);
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::SeqCst);
         std::process::exit(0);
     }).expect("Error setting Ctrl-C handler");
 
     let db = Arc::new(sled::open("world_data").expect("Failed to lock sled DB"));
-    println!("{}", "Kraken Server Active".purple().bold());
+    println!("{}", r#"
+ _  _______         _  _______ _   _ 
+| |/ /  __ \   /\  | |/ /  ___| \ | |
+| ' /| |__) | /  \ | ' /| |__ |  \| |
+|  < |  _  / / /\ \|  < |  __|| . ` |
+| . \| | \ \/ ____ \ . \| |___| |\  |
+|_|\_\_|  \_\/    \_\_|\_\____|_| \_|
+"#.purple().bold());
 
     let server_config = config::ensure_files_exist();
 
