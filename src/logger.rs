@@ -1,25 +1,37 @@
-use std::fmt::Display;
 use owo_colors::OwoColorize;
+use std::fmt::Display;
 
 pub fn log_info_impl(msg: impl Display) {
-    println!("{} {} {}", 
-        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
+    println!(
+        "{} {} {}",
+        chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string()
+            .bright_black(),
         "[INFO]".blue(),
         msg
     );
 }
 
 pub fn log_warn_impl(msg: impl Display) {
-    println!("{} {} {}", 
-        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
+    println!(
+        "{} {} {}",
+        chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string()
+            .bright_black(),
         "[WARN]".yellow(),
         msg
     );
 }
 
 pub fn log_error_impl(msg: impl Display) {
-    println!("{} {} {}", 
-        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
+    println!(
+        "{} {} {}",
+        chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string()
+            .bright_black(),
         "[ERROR]".red(),
         msg
     );
@@ -46,6 +58,6 @@ macro_rules! log_error {
     };
 }
 
+pub(crate) use log_error;
 pub(crate) use log_info;
 pub(crate) use log_warn;
-pub(crate) use log_error;

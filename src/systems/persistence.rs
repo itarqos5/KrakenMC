@@ -1,7 +1,6 @@
-
 use bevy_app::Plugin;
 use bevy_ecs::prelude::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Component)]
 pub struct Dirty;
@@ -51,7 +50,8 @@ fn flush_dirty(
         let db_key = format!("player_{}", state.uuid);
         if let Ok(encoded) = postcard::to_allocvec(&state) {
             use std::io::Write;
-            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             if encoder.write_all(&encoded).is_ok() {
                 if let Ok(compressed) = encoder.finish() {
                     let _ = db.0.insert(db_key, compressed);
@@ -61,4 +61,3 @@ fn flush_dirty(
         commands.entity(entity).remove::<Dirty>();
     }
 }
-

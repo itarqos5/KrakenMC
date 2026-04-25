@@ -1,12 +1,12 @@
 use bevy_ecs::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::io::Write;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use serde::{Deserialize, Serialize};
+use std::io::Write;
 use uuid::Uuid;
 
-use crate::WorldDb;
 use crate::logger::{log_error, log_warn};
+use crate::WorldDb;
 
 #[derive(Component, Serialize, Deserialize, Clone, Debug)]
 pub struct Position {
@@ -51,28 +51,38 @@ pub fn handle_player_join(
 ) {
     for (entity, join_event) in query.iter() {
         // Spawn full player into the ECS
-        commands.entity(entity).insert((
-            PlayerUuid(join_event.0),
-            Position { x: 0.0, y: 70.0, z: 0.0 }, // Spawn coords
-            Health(20.0),
-            XP(0),
-            Inventory(vec![]),
-            Saturation(20.0),
-        )).remove::<PlayerJoinEvent>();
+        commands
+            .entity(entity)
+            .insert((
+                PlayerUuid(join_event.0),
+                Position {
+                    x: 0.0,
+                    y: 70.0,
+                    z: 0.0,
+                }, // Spawn coords
+                Health(20.0),
+                XP(0),
+                Inventory(vec![]),
+                Saturation(20.0),
+            ))
+            .remove::<PlayerJoinEvent>();
     }
 }
 
 pub fn handle_disconnect(
     mut commands: Commands,
-    query: Query<(
-        Entity,
-        &PlayerUuid,
-        &Position,
-        &Health,
-        &XP,
-        &Inventory,
-        &Saturation,
-    ), With<Disconnected>>,
+    query: Query<
+        (
+            Entity,
+            &PlayerUuid,
+            &Position,
+            &Health,
+            &XP,
+            &Inventory,
+            &Saturation,
+        ),
+        With<Disconnected>,
+    >,
     db: Res<WorldDb>,
 ) {
     let mut wrote_any = false;
@@ -95,30 +105,31 @@ pub fn handle_disconnect(
                     let key = format!("player:{}", uuid.0);
                     match db.0.insert(key.as_bytes(), compressed) {
                         Ok(_) => wrote_any = true,
-                        Err(e) => log_error!("Failed to persist disconnected player {}: {}", uuid.0, e),
+                        Err(e) => {
+                            log_error!("Failed to persist disconnected player {}: {}", uuid.0, e)
+                        }
                     }
                 }
             }
         }
-        
+
         commands.entity(entity).despawn();
     }
 
     if wrote_any {
         if let Err(e) = db.0.flush() {
-            log_warn!("Failed to flush disconnected player persistence batch: {}", e);
+            log_warn!(
+                "Failed to flush disconnected player persistence batch: {}",
+                e
+            );
         }
     }
 }
 
-pub fn handle_chat_and_commands() {
-}
+pub fn handle_chat_and_commands() {}
 
-pub fn handle_chunk_request() {
-}
+pub fn handle_chunk_request() {}
 
-pub fn handle_block_break() {
-}
+pub fn handle_block_break() {}
 
-pub fn handle_take_damage() {
-}
+pub fn handle_take_damage() {}

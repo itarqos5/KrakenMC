@@ -1,22 +1,26 @@
-use std::io::{Error, ErrorKind, Write};
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
-use bytes::BytesMut;
-use pumpkin_protocol::bedrock::{client::disconnect_player::CDisconnectPlayer, RAKNET_MAGIC};
+use pumpkin_protocol::java::client::config::{CFinishConfig, CKnownPacks};
 use pumpkin_protocol::java::client::login::{CLoginDisconnect, CLoginSuccess};
-use pumpkin_protocol::packet::{MultiVersionJavaPacket, Packet};
-use pumpkin_protocol::{BClientPacket, ClientPacket, Property};
+use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
+use pumpkin_protocol::java::server::login::SLoginAcknowledged;
+use pumpkin_protocol::packet::MultiVersionJavaPacket;
+use pumpkin_protocol::{ClientPacket, KnownPack, Property};
 use pumpkin_util::version::MinecraftVersion;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 use crate::config::ServerConfig;
 use crate::logger::{log_error, log_info, log_warn};
+use crate::viakraken::utils::{
+    json_escape, packet_id, read_bool_from_slice, read_packet, read_string_from_slice,
+    read_varint_from_slice, write_framed_payload, write_packet, write_string, write_varint_buffer,
+    ByteBuffer,
+};
 
-const MAX_PACKET_LEN: i32 = 2_097_152;
-const BEDROCK_COMING_SOON: &str = "Bedrock Support Coming Soon";
+const NATIVE_PROTOCOL: i32 = 776;
 
 #[derive(Debug, Clone)]
 struct HandshakeInfo {
@@ -36,54 +40,31 @@ struct LoginSuccessCore {
     properties: Vec<Property>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ByteBuffer {
-    inner: BytesMut,
-}
+pub async fn run_backend_listener(
+    listener: TcpListener,
+    config: Arc<ServerConfig>,
+    backend_port: u16,
+) -> std::io::Result<()> {
+    let backend_addr = format!("0.0.0.0:{}", backend_port);
+    log_info!("Kraken backend listening on {}", backend_addr);
 
-impl ByteBuffer {
-    fn new() -> Self {
-        Self {
-            inner: BytesMut::new(),
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        self.inner.extend_from_slice(&[byte]);
-    }
-
-    fn extend_from_slice(&mut self, bytes: &[u8]) {
-        self.inner.extend_from_slice(bytes);
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.inner.as_ref()
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_backend_client(stream, cfg).await {
+                log_warn!("Backend session {} closed with error: {}", peer_addr, e);
+            }
+        });
     }
 }
 
-impl Write for ByteBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-pub async fn handle_connection(
+pub async fn handle_java_connection(
     mut client: TcpStream,
     peer_addr: std::net::SocketAddr,
     _config: Arc<ServerConfig>,
     backend_port: u16,
 ) -> std::io::Result<()> {
-    if is_probably_bedrock(&mut client).await? {
-        log_info!("Bedrock ingress detected from {}", peer_addr);
-        handle_bedrock_handler(&mut client).await?;
-        return Ok(());
-    }
-
     let first_packet = read_packet(&mut client).await?;
     let handshake = parse_handshake(&first_packet)?;
 
@@ -122,11 +103,7 @@ pub async fn handle_connection(
                 )
                 .await;
             }
-            log_error!(
-                "Failed to connect proxy backend for {}: {}",
-                peer_addr,
-                e
-            );
+            log_error!("Failed to connect proxy backend for {}: {}", peer_addr, e);
             return Ok(());
         }
     };
@@ -213,6 +190,141 @@ pub async fn handle_connection(
     Ok(())
 }
 
+async fn handle_backend_client(
+    mut stream: TcpStream,
+    config: Arc<ServerConfig>,
+) -> std::io::Result<()> {
+    let handshake_packet = read_packet(&mut stream).await?;
+    let handshake = parse_handshake(&handshake_packet)?;
+
+    match handshake.next_state {
+        1 => handle_status(&mut stream, &config, handshake.protocol_version).await,
+        2 => handle_login(&mut stream, &config, handshake.protocol_version).await,
+        _ => Err(Error::new(
+            ErrorKind::InvalidData,
+            "invalid handshake next state",
+        )),
+    }
+}
+
+async fn handle_status(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+    protocol_version: i32,
+) -> std::io::Result<()> {
+    let request_packet = read_packet(stream).await?;
+    let mut offset = 0usize;
+    let request_id = read_varint_from_slice(&request_packet, &mut offset)?;
+    if request_id != 0x00 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "expected status request packet id 0",
+        ));
+    }
+
+    let motd = json_escape(&config.motd);
+    let advertised_protocol = if protocol_version == NATIVE_PROTOCOL {
+        NATIVE_PROTOCOL
+    } else {
+        protocol_version
+    };
+    let status_json = format!(
+        r#"{{"version":{{"name":"1.21.1","protocol":{}}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":"{}"}}}}"#,
+        advertised_protocol, config.max_players, motd
+    );
+
+    let mut payload = Vec::new();
+    write_string(&mut payload, &status_json)?;
+    write_packet(stream, 0x00, &payload).await?;
+
+    if let Ok(Ok(ping_packet)) = timeout(Duration::from_secs(15), read_packet(stream)).await {
+        let mut ping_offset = 0usize;
+        let ping_id = read_varint_from_slice(&ping_packet, &mut ping_offset)?;
+        if ping_id == 0x01 && ping_offset + 8 <= ping_packet.len() {
+            let mut pong_payload = Vec::with_capacity(8);
+            pong_payload.extend_from_slice(&ping_packet[ping_offset..ping_offset + 8]);
+            write_packet(stream, 0x01, &pong_payload).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_login(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+    protocol_version: i32,
+) -> std::io::Result<()> {
+    let version = minecraft_version_from_protocol(protocol_version)?;
+
+    let login_start_packet = read_packet(stream).await?;
+    let (username, claimed_uuid) = parse_login_start(&login_start_packet)?;
+    let profile_uuid = claimed_uuid.unwrap_or_else(Uuid::new_v4);
+    let properties: Vec<Property> = Vec::new();
+
+    let strict_error_handling = strict_error_handling(protocol_version);
+    let login_success =
+        CLoginSuccess::new(&profile_uuid, &username, &properties, strict_error_handling);
+    let login_success_payload = encode_java_packet(&login_success, version)?;
+    write_framed_payload(stream, login_success_payload.as_slice()).await?;
+
+    let login_ack_id = packet_id_for_version::<SLoginAcknowledged>(version, "login-ack")?;
+    if let Ok(Ok(login_ack_packet)) = timeout(Duration::from_secs(15), read_packet(stream)).await {
+        let ack_id = packet_id(&login_ack_packet)?;
+        if ack_id != login_ack_id {
+            log_warn!(
+                "Unexpected login packet after Login Success: id={} expected={} (user={})",
+                ack_id,
+                login_ack_id,
+                username
+            );
+        }
+    }
+
+    let known_packs: [KnownPack<'static>; 0] = [];
+    let known_packs_packet = CKnownPacks::new(&known_packs);
+    let known_packs_payload = encode_java_packet(&known_packs_packet, version)?;
+    write_framed_payload(stream, known_packs_payload.as_slice()).await?;
+
+    let finish_config_packet = CFinishConfig;
+    let finish_config_payload = encode_java_packet(&finish_config_packet, version)?;
+    write_framed_payload(stream, finish_config_payload.as_slice()).await?;
+
+    let mut entered_play = false;
+    let config_finish_id =
+        packet_id_for_version::<SAcknowledgeFinishConfig>(version, "config-finish")?;
+    if let Ok(Ok(config_finish_packet)) =
+        timeout(Duration::from_secs(15), read_packet(stream)).await
+    {
+        let finish_id = packet_id(&config_finish_packet)?;
+        if finish_id == config_finish_id {
+            entered_play = true;
+        } else {
+            log_warn!(
+                "Unexpected config packet for {}: id={} expected={}",
+                username,
+                finish_id,
+                config_finish_id
+            );
+        }
+    }
+
+    if !entered_play {
+        log_warn!(
+            "Did not receive config-finish from {}; transition to Play not confirmed",
+            username
+        );
+    }
+
+    log_info!(
+        "Login flow completed for {} (protocol={}, max_players={})",
+        username,
+        protocol_version,
+        config.max_players
+    );
+    Ok(())
+}
+
 async fn relay_status_exchange(
     client: &mut TcpStream,
     backend: &mut TcpStream,
@@ -237,11 +349,9 @@ async fn read_login_start_and_forward(
     backend: &mut TcpStream,
 ) -> std::io::Result<LoginStartInfo> {
     let login_start = read_packet(client).await?;
-    let username = parse_login_start_username(&login_start)
-        .unwrap_or_else(|_| "Literal_u".to_owned());
-
+    let username =
+        parse_login_start_username(&login_start).unwrap_or_else(|_| "Literal_u".to_owned());
     write_framed_payload(backend, &login_start).await?;
-
     Ok(LoginStartInfo { username })
 }
 
@@ -252,32 +362,81 @@ async fn relay_login_handoff(
     version: MinecraftVersion,
     fallback_username: &str,
 ) -> std::io::Result<Option<String>> {
+    enum Phase {
+        Login,
+        Config,
+    }
+
+    let login_success_id =
+        packet_id_for_version::<CLoginSuccess<'static>>(version, "login-success")?;
+    let login_disconnect_id =
+        packet_id_for_version::<CLoginDisconnect>(version, "login-disconnect")?;
+    let login_ack_id = packet_id_for_version::<SLoginAcknowledged>(version, "login-ack")?;
+    let config_finish_clientbound_id =
+        packet_id_for_version::<CFinishConfig>(version, "config-finish-clientbound")?;
+    let config_finish_serverbound_id =
+        packet_id_for_version::<SAcknowledgeFinishConfig>(version, "config-finish-serverbound")?;
+
+    let mut phase = Phase::Login;
+    let mut player_name: Option<String> = None;
+    let mut backend_sent_finish_config = false;
+    let mut client_sent_finish_config = false;
+
     loop {
         tokio::select! {
             backend_packet = read_packet(backend) => {
                 let backend_packet = backend_packet?;
                 let backend_id = packet_id(&backend_packet)?;
 
-                if backend_id == 0x02 {
+                if matches!(phase, Phase::Login) && backend_id == login_success_id {
                     let core = parse_backend_login_success(&backend_packet)?;
-                    let strict_error_handling = protocol_version >= 767;
+                    let strict_error_handling = strict_error_handling(protocol_version);
                     let rebuilt = build_login_success_packet(&core, version, strict_error_handling)?;
-
                     write_framed_payload(client, rebuilt.as_slice()).await?;
-                    log_info!("Configuration transition armed (state=3) for {}", core.username);
 
-                    return Ok(Some(core.username));
+                    player_name = Some(core.username.clone());
+                    log_info!("Configuration transition armed (state=3) for {}", core.username);
+                    continue;
                 }
 
                 write_framed_payload(client, &backend_packet).await?;
-                if backend_id == 0x00 {
+
+                if matches!(phase, Phase::Login) && backend_id == login_disconnect_id {
                     return Ok(None);
+                }
+
+                if matches!(phase, Phase::Config) && backend_id == config_finish_clientbound_id {
+                    backend_sent_finish_config = true;
+                    if client_sent_finish_config {
+                        return Ok(Some(player_name.unwrap_or_else(|| fallback_username.to_owned())));
+                    }
                 }
             }
 
             client_packet = read_packet(client) => {
                 let client_packet = client_packet?;
+                let client_id = packet_id(&client_packet)?;
                 write_framed_payload(backend, &client_packet).await?;
+
+                match phase {
+                    Phase::Login => {
+                        if client_id == login_ack_id && player_name.is_some() {
+                            phase = Phase::Config;
+                            log_info!(
+                                "Client {} acknowledged login; entering configuration relay",
+                                player_name.as_deref().unwrap_or(fallback_username)
+                            );
+                        }
+                    }
+                    Phase::Config => {
+                        if client_id == config_finish_serverbound_id {
+                            client_sent_finish_config = true;
+                            if backend_sent_finish_config {
+                                return Ok(Some(player_name.unwrap_or_else(|| fallback_username.to_owned())));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -360,7 +519,6 @@ fn build_login_success_packet(
         &core.properties,
         strict_error_handling,
     );
-
     encode_java_packet(&packet, version)
 }
 
@@ -372,7 +530,10 @@ fn encode_java_packet<P: ClientPacket>(
     if packet_id < 0 {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("packet id unavailable for version {}", version.protocol_version()),
+            format!(
+                "packet id unavailable for version {}",
+                version.protocol_version()
+            ),
         ));
     }
 
@@ -397,19 +558,6 @@ async fn send_login_disconnect_json(
     write_framed_payload(stream, payload.as_slice()).await
 }
 
-fn parse_login_start_username(packet: &[u8]) -> std::io::Result<String> {
-    let mut offset = 0usize;
-    let id = read_varint_from_slice(packet, &mut offset)?;
-    if id != 0x00 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("expected login start packet id 0x00, got 0x{id:02x}"),
-        ));
-    }
-
-    read_string_from_slice(packet, &mut offset)
-}
-
 fn parse_handshake(payload: &[u8]) -> std::io::Result<HandshakeInfo> {
     let mut offset = 0usize;
     let packet_id = read_varint_from_slice(payload, &mut offset)?;
@@ -432,183 +580,59 @@ fn parse_handshake(payload: &[u8]) -> std::io::Result<HandshakeInfo> {
     offset += 2;
 
     let next_state = read_varint_from_slice(payload, &mut offset)?;
-
     Ok(HandshakeInfo {
         protocol_version,
         next_state,
     })
 }
 
-fn write_varint_buffer(buf: &mut ByteBuffer, value: i32) {
-    let mut val = value as u32;
-    loop {
-        if (val & !0x7F) == 0 {
-            buf.push(val as u8);
-            break;
-        }
-        buf.push(((val & 0x7F) as u8) | 0x80);
-        val >>= 7;
-    }
-}
-
-fn read_varint_from_slice(data: &[u8], offset: &mut usize) -> std::io::Result<i32> {
-    let mut num_read = 0;
-    let mut result: i32 = 0;
-
-    loop {
-        if *offset >= data.len() {
-            return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                "unexpected eof while reading varint",
-            ));
-        }
-
-        let read = data[*offset];
-        *offset += 1;
-
-        let value = (read & 0x7F) as i32;
-        result |= value << (7 * num_read);
-
-        num_read += 1;
-        if num_read > 5 {
-            return Err(Error::new(ErrorKind::InvalidData, "varint too big"));
-        }
-
-        if (read & 0x80) == 0 {
-            break;
-        }
-    }
-
-    Ok(result)
-}
-
-async fn read_varint(stream: &mut TcpStream) -> std::io::Result<i32> {
-    let mut num_read = 0;
-    let mut result: i32 = 0;
-
-    loop {
-        let mut one = [0u8; 1];
-        stream.read_exact(&mut one).await?;
-
-        let value = (one[0] & 0x7F) as i32;
-        result |= value << (7 * num_read);
-
-        num_read += 1;
-        if num_read > 5 {
-            return Err(Error::new(ErrorKind::InvalidData, "varint too big"));
-        }
-
-        if (one[0] & 0x80) == 0 {
-            break;
-        }
-    }
-
-    Ok(result)
-}
-
-fn read_string_from_slice(data: &[u8], offset: &mut usize) -> std::io::Result<String> {
-    let len = read_varint_from_slice(data, offset)?;
-    if len < 0 {
-        return Err(Error::new(ErrorKind::InvalidData, "negative string length"));
-    }
-
-    let len = len as usize;
-    if *offset + len > data.len() {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "not enough bytes for string",
-        ));
-    }
-
-    let value = std::str::from_utf8(&data[*offset..*offset + len])
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid utf8 in string"))?
-        .to_owned();
-
-    *offset += len;
-    Ok(value)
-}
-
-fn read_bool_from_slice(data: &[u8], offset: &mut usize) -> std::io::Result<bool> {
-    if *offset >= data.len() {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "unexpected eof while reading bool",
-        ));
-    }
-
-    let value = data[*offset];
-    *offset += 1;
-
-    match value {
-        0x00 => Ok(false),
-        0x01 => Ok(true),
-        _ => Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("invalid boolean byte 0x{value:02x}"),
-        )),
-    }
-}
-
-async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let packet_len = read_varint(stream).await?;
-    if !(0..=MAX_PACKET_LEN).contains(&packet_len) {
-        return Err(Error::new(ErrorKind::InvalidData, "invalid packet length"));
-    }
-
-    let mut payload = vec![0u8; packet_len as usize];
-    stream.read_exact(&mut payload).await?;
-    Ok(payload)
-}
-
-async fn write_framed_payload(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
-    if payload.len() > MAX_PACKET_LEN as usize {
-        return Err(Error::new(ErrorKind::InvalidInput, "payload too large"));
-    }
-
-    let mut frame = ByteBuffer::new();
-    write_varint_buffer(&mut frame, payload.len() as i32);
-    frame.extend_from_slice(payload);
-
-    stream.write_all(frame.as_slice()).await?;
-    Ok(())
-}
-
-fn packet_id(packet: &[u8]) -> std::io::Result<i32> {
+fn parse_login_start(packet: &[u8]) -> std::io::Result<(String, Option<Uuid>)> {
     let mut offset = 0usize;
-    read_varint_from_slice(packet, &mut offset)
-}
-
-async fn is_probably_bedrock(stream: &mut TcpStream) -> std::io::Result<bool> {
-    let mut sniff = [0u8; 32];
-    let count = stream.peek(&mut sniff).await?;
-    if count == 0 {
-        return Ok(false);
+    let id = read_varint_from_slice(packet, &mut offset)?;
+    if id != 0x00 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("expected login start packet id 0x00, got 0x{id:02x}"),
+        ));
     }
 
-    let data = &sniff[..count];
-    let first = data[0];
-    let raknet_offline_id = matches!(first, 0x01 | 0x05 | 0x07 | 0x09 | 0x1c);
-    let has_magic = data
-        .windows(RAKNET_MAGIC.len())
-        .any(|window| window == RAKNET_MAGIC.as_slice());
+    let username = read_string_from_slice(packet, &mut offset)?;
+    let uuid = if offset + 16 <= packet.len() {
+        let mut uuid_bytes = [0u8; 16];
+        uuid_bytes.copy_from_slice(&packet[offset..offset + 16]);
+        Some(Uuid::from_bytes(uuid_bytes))
+    } else {
+        None
+    };
 
-    Ok(raknet_offline_id || has_magic)
+    Ok((username, uuid))
 }
 
-async fn handle_bedrock_handler(stream: &mut TcpStream) -> std::io::Result<()> {
-    let packet = CDisconnectPlayer::new(2, BEDROCK_COMING_SOON.to_owned());
+fn parse_login_start_username(packet: &[u8]) -> std::io::Result<String> {
+    let (username, _) = parse_login_start(packet)?;
+    Ok(username)
+}
 
-    let mut response = ByteBuffer::new();
-    response.push(CDisconnectPlayer::PACKET_ID as u8);
-    packet
-        .write_packet(&mut response)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+fn strict_error_handling(protocol_version: i32) -> bool {
+    protocol_version == 774 || protocol_version >= 767
+}
 
-    stream.write_all(response.as_slice()).await?;
-    stream.flush().await?;
-    let _ = stream.shutdown().await;
-
-    Ok(())
+fn packet_id_for_version<P: MultiVersionJavaPacket>(
+    version: MinecraftVersion,
+    label: &str,
+) -> std::io::Result<i32> {
+    let id = <P as MultiVersionJavaPacket>::to_id(version);
+    if id < 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "packet {} unavailable for protocol {}",
+                label,
+                version.protocol_version()
+            ),
+        ));
+    }
+    Ok(id)
 }
 
 fn is_supported_login_protocol(protocol: i32) -> bool {
@@ -635,8 +659,10 @@ fn minecraft_version_from_protocol(protocol: i32) -> std::io::Result<MinecraftVe
 }
 
 fn is_decoder_exception(error: &Error) -> bool {
-    matches!(error.kind(), ErrorKind::InvalidData | ErrorKind::UnexpectedEof)
-        || error.to_string().contains("DecoderException")
+    matches!(
+        error.kind(),
+        ErrorKind::InvalidData | ErrorKind::UnexpectedEof
+    ) || error.to_string().contains("DecoderException")
 }
 
 async fn infer_bridge_failure_direction(
@@ -668,19 +694,4 @@ async fn stream_looks_closed(stream: &mut TcpStream) -> bool {
         ),
         Err(_) => false,
     }
-}
-
-fn json_escape(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out
 }

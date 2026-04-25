@@ -25,8 +25,12 @@ impl Default for ServerConfig {
 }
 
 pub fn ensure_files_exist() -> ServerConfig {
-    let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-    
+    let exe_dir = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
     // Create world folders
     let _ = fs::create_dir_all(exe_dir.join("world"));
     let _ = fs::create_dir_all(exe_dir.join("world_nether"));
@@ -64,7 +68,9 @@ pub fn ensure_files_exist() -> ServerConfig {
     } else {
         let contents = fs::read_to_string(&props_path).unwrap();
         for line in contents.lines() {
-            if line.starts_with('#') || line.is_empty() { continue; }
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
             let mut parts = line.splitn(2, '=');
             if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
                 match k.trim() {
