@@ -17,6 +17,11 @@ struct HandshakeInfo {
     next_state: i32,
 }
 
+#[derive(Debug, Clone)]
+struct LoginStartInfo {
+    username: String,
+}
+
 pub async fn handle_connection(
     mut client: TcpStream,
     peer_addr: std::net::SocketAddr,
@@ -100,24 +105,41 @@ pub async fn handle_connection(
         return Ok(());
     }
 
-    let normalized_login_success = match relay_login_handoff(&mut client, &mut backend).await? {
-        Some(packet) => packet,
-        None => return Ok(()),
-    };
+    let login_start = read_login_start_and_forward(&mut client, &mut backend).await?;
+    let player = login_start.username;
 
-    write_framed_payload(&mut client, &normalized_login_success).await?;
+    if let Err(e) = client.set_nodelay(true) {
+        log_warn!("Failed to set TCP_NODELAY for client {}: {}", peer_addr, e);
+    }
+    if let Err(e) = backend.set_nodelay(true) {
+        log_warn!("Failed to set TCP_NODELAY for backend {}: {}", peer_addr, e);
+    }
 
-    match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
+    log_info!("Bridge established for {} ({})", player, peer_addr);
+
+    let mut bridge = Box::pin(tokio::io::copy_bidirectional(&mut client, &mut backend));
+    let bridge_result = bridge.as_mut().await;
+    drop(bridge);
+
+    match bridge_result {
         Ok((to_backend, to_client)) => {
             log_info!(
-                "Bridge closed for {} (to_backend={} bytes, to_client={} bytes)",
+                "Bridge closed for {} ({}) (to_backend={} bytes, to_client={} bytes)",
+                player,
                 peer_addr,
                 to_backend,
                 to_client
             );
         }
         Err(e) => {
-            log_warn!("Bridge terminated for {}: {}", peer_addr, e);
+            let direction = infer_bridge_failure_direction(&mut client, &mut backend).await;
+            log_warn!(
+                "Bridge failed for {} ({}) direction={} error={}",
+                player,
+                peer_addr,
+                direction,
+                e
+            );
         }
     }
 
@@ -140,78 +162,58 @@ async fn relay_status_exchange(client: &mut TcpStream, backend: &mut TcpStream) 
     Ok(())
 }
 
-async fn relay_login_handoff(
+async fn read_login_start_and_forward(
     client: &mut TcpStream,
     backend: &mut TcpStream,
-) -> std::io::Result<Option<Vec<u8>>> {
-    loop {
-        tokio::select! {
-            backend_packet = read_packet(backend) => {
-                let backend_packet = backend_packet?;
-                let backend_id = packet_id(&backend_packet)?;
+) -> std::io::Result<LoginStartInfo> {
+    let login_start = read_packet(client).await?;
+    let username = parse_login_start_username(&login_start)
+        .unwrap_or_else(|_| "unknown-player".to_owned());
 
-                if backend_id == 0x02 {
-                    let normalized = normalize_login_success(&backend_packet)?;
-                    return Ok(Some(normalized));
-                }
+    write_framed_payload(backend, &login_start).await?;
 
-                write_framed_payload(client, &backend_packet).await?;
-
-                if backend_id == 0x00 {
-                    return Ok(None);
-                }
-            }
-
-            client_packet = read_packet(client) => {
-                let client_packet = client_packet?;
-                write_framed_payload(backend, &client_packet).await?;
-            }
-        }
-    }
+    Ok(LoginStartInfo { username })
 }
 
-fn normalize_login_success(packet: &[u8]) -> std::io::Result<Vec<u8>> {
+fn parse_login_start_username(packet: &[u8]) -> std::io::Result<String> {
     let mut offset = 0usize;
     let id = read_varint_from_slice(packet, &mut offset)?;
-    if id != 0x02 {
+    if id != 0x00 {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("expected login success packet id 0x02, got 0x{id:02x}"),
+            format!("expected login start packet id 0x00, got 0x{id:02x}"),
         ));
     }
 
-    if offset + 16 > packet.len() {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "login success is missing 16-byte UUID",
-        ));
-    }
-
-    let mut uuid_bytes = [0u8; 16];
-    uuid_bytes.copy_from_slice(&packet[offset..offset + 16]);
-    offset += 16;
-
-    let username = read_string_from_slice(packet, &mut offset)?;
-    let properties = read_varint_from_slice(packet, &mut offset)?;
-    if properties < 0 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "login success properties count cannot be negative",
-        ));
-    }
-
-    let mut normalized = Vec::new();
-    write_varint(&mut normalized, 0x02);
-    normalized.extend_from_slice(&uuid_bytes);
-    write_string(&mut normalized, &username)?;
-    write_varint(&mut normalized, 0);
-
-    Ok(normalized)
+    read_string_from_slice(packet, &mut offset)
 }
 
-fn packet_id(packet: &[u8]) -> std::io::Result<i32> {
-    let mut offset = 0usize;
-    read_varint_from_slice(packet, &mut offset)
+async fn infer_bridge_failure_direction(client: &mut TcpStream, backend: &mut TcpStream) -> &'static str {
+    let client_closed = stream_looks_closed(client).await;
+    let backend_closed = stream_looks_closed(backend).await;
+
+    match (client_closed, backend_closed) {
+        (true, false) => "client_to_backend",
+        (false, true) => "backend_to_client",
+        (true, true) => "both_sides",
+        (false, false) => "unknown",
+    }
+}
+
+async fn stream_looks_closed(stream: &mut TcpStream) -> bool {
+    let mut buf = [0u8; 1];
+    match timeout(Duration::from_millis(5), stream.peek(&mut buf)).await {
+        Ok(Ok(0)) => true,
+        Ok(Ok(_)) => false,
+        Ok(Err(e)) => matches!(
+            e.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::BrokenPipe
+                | ErrorKind::NotConnected
+                | ErrorKind::UnexpectedEof
+        ),
+        Err(_) => false,
+    }
 }
 
 async fn send_login_disconnect(stream: &mut TcpStream, json_reason: &str) -> std::io::Result<()> {
