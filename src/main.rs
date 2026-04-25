@@ -21,7 +21,15 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 pub struct WorldDb(pub Arc<sled::Db>);
 
 fn main() {
-    owo_colors::set_override(true);
+    let color_supported = if cfg!(windows) {
+        std::env::var("WT_SESSION").is_ok()
+            || std::env::var("ANSICON").is_ok()
+            || std::env::var("ConEmuANSI").map(|v| v.eq_ignore_ascii_case("on")).unwrap_or(false)
+            || std::env::var("TERM").map(|v| v.contains("xterm") || v.contains("ansi")).unwrap_or(false)
+    } else {
+        true
+    };
+    owo_colors::set_override(color_supported);
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::SeqCst);
         std::process::exit(0);
