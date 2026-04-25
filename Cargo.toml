@@ -33,6 +33,8 @@ azalea-block = "0.16.0"
 bevy_app = "0.18.1"
 bevy_ecs = "0.18.1"
 uuid = { version = "1.23.1", features = ["v4"] }
+pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-protocol" }
+pumpkin-util = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-util" }
 
 [profile.release]
 lto = true
