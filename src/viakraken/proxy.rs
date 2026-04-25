@@ -93,7 +93,7 @@ pub async fn handle_connection(
         return Ok(());
     }
 
-    relay_login_and_configuration(&mut client, &mut backend).await?;
+    relay_login_and_configuration(&mut client, &mut backend, handshake.protocol_version).await?;
 
     match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
         Ok((to_backend, to_client)) => {
@@ -128,55 +128,69 @@ async fn relay_status_exchange(client: &mut TcpStream, backend: &mut TcpStream) 
     Ok(())
 }
 
-async fn relay_login_and_configuration(client: &mut TcpStream, backend: &mut TcpStream) -> std::io::Result<()> {
-    let login_start = read_packet(client).await?;
-    let login_start_id = packet_id(&login_start)?;
-    if login_start_id != 0x00 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "expected login start packet id 0x00",
-        ));
+async fn relay_login_and_configuration(
+    client: &mut TcpStream,
+    backend: &mut TcpStream,
+    protocol_version: i32,
+) -> std::io::Result<()> {
+    enum Phase {
+        Login,
+        Configuration,
+        PlayPendingBrand,
     }
-    write_framed_payload(backend, &login_start).await?;
 
-    let login_success_raw = read_packet(backend).await?;
-    let login_success = normalize_login_success(&login_success_raw)?;
-    write_framed_payload(client, &login_success).await?;
+    let brand = if protocol_version == NATIVE_PROTOCOL {
+        "Kraken"
+    } else {
+        "Kraken (ViaKraken)"
+    };
 
-    let login_ack = read_packet(client).await?;
-    let login_ack_id = packet_id(&login_ack)?;
-    if login_ack_id != 0x03 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("expected login acknowledged 0x03, got 0x{login_ack_id:02x}"),
-        ));
-    }
-    write_framed_payload(backend, &login_ack).await?;
+    let mut phase = Phase::Login;
 
-    let mut server_finished_config = false;
-    let mut client_finished_config = false;
+    loop {
+        tokio::select! {
+            client_packet = read_packet(client) => {
+                let client_packet = client_packet?;
+                let client_id = packet_id(&client_packet)?;
 
-    while !(server_finished_config && client_finished_config) {
-        if !server_finished_config {
-            let server_packet = read_packet(backend).await?;
-            let server_id = packet_id(&server_packet)?;
-            if server_id == 0x03 {
-                server_finished_config = true;
+                if matches!(phase, Phase::Login) && client_id == 0x03 {
+                    phase = Phase::Configuration;
+                } else if matches!(phase, Phase::Configuration) && client_id == 0x03 {
+                    phase = Phase::PlayPendingBrand;
+                }
+
+                write_framed_payload(backend, &client_packet).await?;
             }
-            write_framed_payload(client, &server_packet).await?;
-        }
 
-        if !client_finished_config {
-            let client_packet = read_packet(client).await?;
-            let client_id = packet_id(&client_packet)?;
-            if client_id == 0x03 {
-                client_finished_config = true;
+            backend_packet = read_packet(backend) => {
+                let backend_packet = backend_packet?;
+                let backend_id = packet_id(&backend_packet)?;
+
+                if matches!(phase, Phase::Configuration) && (backend_id == 0x07 || backend_id == 0x05) {
+                    log_info!("Relaying configuration registry_data packet id=0x{backend_id:02x}");
+                }
+
+                if matches!(phase, Phase::Login) && backend_id == 0x02 {
+                    let normalized = normalize_login_success(&backend_packet)?;
+                    write_framed_payload(client, &normalized).await?;
+                } else {
+                    write_framed_payload(client, &backend_packet).await?;
+                }
+
+                if matches!(phase, Phase::PlayPendingBrand) {
+                    inject_play_brand(client, brand).await?;
+                    return Ok(());
+                }
             }
-            write_framed_payload(backend, &client_packet).await?;
         }
     }
+}
 
-    Ok(())
+async fn inject_play_brand(client: &mut TcpStream, brand: &str) -> std::io::Result<()> {
+    let mut payload = Vec::new();
+    write_string(&mut payload, "minecraft:brand")?;
+    write_string(&mut payload, brand)?;
+    write_packet(client, 0x18, &payload).await
 }
 
 fn normalize_login_success(packet: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -207,10 +221,6 @@ fn normalize_login_success(packet: &[u8]) -> std::io::Result<Vec<u8>> {
             ErrorKind::InvalidData,
             "login success properties count cannot be negative",
         ));
-    }
-
-    if properties != 0 {
-        return Ok(packet.to_vec());
     }
 
     let mut normalized = Vec::new();
