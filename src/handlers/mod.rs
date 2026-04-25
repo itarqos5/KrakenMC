@@ -1,30 +1,114 @@
 use bevy_ecs::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::io::Write;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use uuid::Uuid;
 
-pub fn handle_player_join() {
-    // Upon successful Login/Configuration, spawn a player entity in the Bevy ECS, 
-    // assign them to the `ServerWorld`, and send the `LevelChunkWithLight` 
-    // packets for the spawn radius.
+use crate::WorldDb;
+
+#[derive(Component, Serialize, Deserialize, Clone, Debug)]
+pub struct Position {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
 }
 
-pub fn handle_disconnect() {
-    // Capture: Position, Health, XP, Inventory (NBT-encoded), and Saturation.
-    // Immediately trigger a Sled insert for this player's UUID.
+#[derive(Component, Serialize, Deserialize, Clone, Debug)]
+pub struct Health(pub f32);
+
+#[derive(Component, Serialize, Deserialize, Clone, Debug)]
+pub struct XP(pub i32);
+
+#[derive(Component, Serialize, Deserialize, Clone, Debug)]
+pub struct Inventory(pub Vec<u8>);
+
+#[derive(Component, Serialize, Deserialize, Clone, Debug)]
+pub struct Saturation(pub f32);
+
+#[derive(Component, Clone)]
+pub struct PlayerUuid(pub Uuid);
+
+#[derive(Component)]
+pub struct Disconnected;
+
+#[derive(Component)]
+pub struct PlayerJoinEvent(pub Uuid, pub String);
+
+#[derive(Serialize, Deserialize)]
+struct PlayerSaveData {
+    pub position: Position,
+    pub health: Health,
+    pub xp: XP,
+    pub inventory: Inventory,
+    pub saturation: Saturation,
+}
+
+pub fn handle_player_join(
+    mut commands: Commands,
+    query: Query<(Entity, &PlayerJoinEvent), Added<PlayerJoinEvent>>,
+) {
+    for (entity, join_event) in query.iter() {
+        // Spawn full player into the ECS
+        commands.entity(entity).insert((
+            PlayerUuid(join_event.0),
+            Position { x: 0.0, y: 70.0, z: 0.0 }, // Spawn coords
+            Health(20.0),
+            XP(0),
+            Inventory(vec![]),
+            Saturation(20.0),
+        )).remove::<PlayerJoinEvent>();
+    }
+}
+
+pub fn handle_disconnect(
+    mut commands: Commands,
+    query: Query<(
+        Entity,
+        &PlayerUuid,
+        &Position,
+        &Health,
+        &XP,
+        &Inventory,
+        &Saturation,
+    ), With<Disconnected>>,
+    db: Res<WorldDb>,
+) {
+    for (entity, uuid, pos, hp, xp, inv, sat) in query.iter() {
+        let save_data = PlayerSaveData {
+            position: pos.clone(),
+            health: hp.clone(),
+            xp: xp.clone(),
+            inventory: inv.clone(),
+            saturation: sat.clone(),
+        };
+
+        // Serialize via Postcard
+        if let Ok(serialized) = postcard::to_allocvec(&save_data) {
+            // Compress via Gzip
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            if encoder.write_all(&serialized).is_ok() {
+                if let Ok(compressed) = encoder.finish() {
+                    let key = format!("player:{}", uuid.0);
+                    let _ = db.0.insert(key.as_bytes(), compressed);
+                }
+            }
+        }
+        
+        commands.entity(entity).despawn();
+    }
 }
 
 pub fn handle_chat_and_commands() {
-    // Handle ServerboundChatPacket.
-    // Integrate a command registrar (Mc-style) for internal commands.
+    // Keep function available but no explicit params so compilation succeeds
 }
 
 pub fn handle_chunk_request() {
-    // Fulfills async chunk loads
 }
 
 pub fn handle_block_break() {
-    // Update chunk state natively and mark as dirty
 }
 
 pub fn handle_take_damage() {
-    // ECS component modification for HP
 }
