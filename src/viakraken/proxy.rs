@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
 
 use crate::config::ServerConfig;
 use crate::logger::{log_error, log_info, log_warn};
@@ -87,6 +88,13 @@ pub async fn handle_connection(
 
     write_framed_payload(&mut backend, &first_packet).await?;
 
+    if handshake.next_state == 1 {
+        relay_status_exchange(&mut client, &mut backend).await?;
+        return Ok(());
+    }
+
+    relay_login_and_configuration(&mut client, &mut backend).await?;
+
     match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
         Ok((to_backend, to_client)) => {
             log_info!(
@@ -102,6 +110,121 @@ pub async fn handle_connection(
     }
 
     Ok(())
+}
+
+async fn relay_status_exchange(client: &mut TcpStream, backend: &mut TcpStream) -> std::io::Result<()> {
+    let status_request = read_packet(client).await?;
+    write_framed_payload(backend, &status_request).await?;
+
+    let status_response = read_packet(backend).await?;
+    write_framed_payload(client, &status_response).await?;
+
+    if let Ok(Ok(ping_request)) = timeout(Duration::from_secs(10), read_packet(client)).await {
+        write_framed_payload(backend, &ping_request).await?;
+        let pong_response = read_packet(backend).await?;
+        write_framed_payload(client, &pong_response).await?;
+    }
+
+    Ok(())
+}
+
+async fn relay_login_and_configuration(client: &mut TcpStream, backend: &mut TcpStream) -> std::io::Result<()> {
+    let login_start = read_packet(client).await?;
+    let login_start_id = packet_id(&login_start)?;
+    if login_start_id != 0x00 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "expected login start packet id 0x00",
+        ));
+    }
+    write_framed_payload(backend, &login_start).await?;
+
+    let login_success_raw = read_packet(backend).await?;
+    let login_success = normalize_login_success(&login_success_raw)?;
+    write_framed_payload(client, &login_success).await?;
+
+    let login_ack = read_packet(client).await?;
+    let login_ack_id = packet_id(&login_ack)?;
+    if login_ack_id != 0x03 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("expected login acknowledged 0x03, got 0x{login_ack_id:02x}"),
+        ));
+    }
+    write_framed_payload(backend, &login_ack).await?;
+
+    let mut server_finished_config = false;
+    let mut client_finished_config = false;
+
+    while !(server_finished_config && client_finished_config) {
+        if !server_finished_config {
+            let server_packet = read_packet(backend).await?;
+            let server_id = packet_id(&server_packet)?;
+            if server_id == 0x03 {
+                server_finished_config = true;
+            }
+            write_framed_payload(client, &server_packet).await?;
+        }
+
+        if !client_finished_config {
+            let client_packet = read_packet(client).await?;
+            let client_id = packet_id(&client_packet)?;
+            if client_id == 0x03 {
+                client_finished_config = true;
+            }
+            write_framed_payload(backend, &client_packet).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_login_success(packet: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut offset = 0usize;
+    let id = read_varint_from_slice(packet, &mut offset)?;
+    if id != 0x02 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("expected login success packet id 0x02, got 0x{id:02x}"),
+        ));
+    }
+
+    if offset + 16 > packet.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "login success is missing 16-byte UUID",
+        ));
+    }
+
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&packet[offset..offset + 16]);
+    offset += 16;
+
+    let username = read_string_from_slice(packet, &mut offset)?;
+    let properties = read_varint_from_slice(packet, &mut offset)?;
+    if properties < 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "login success properties count cannot be negative",
+        ));
+    }
+
+    if properties != 0 {
+        return Ok(packet.to_vec());
+    }
+
+    let mut normalized = Vec::new();
+    write_varint(&mut normalized, 0x02);
+    normalized.extend_from_slice(&uuid_bytes);
+    write_string(&mut normalized, &username)?;
+    write_varint(&mut normalized, 0);
+
+    Ok(normalized)
+}
+
+fn packet_id(packet: &[u8]) -> std::io::Result<i32> {
+    let mut offset = 0usize;
+    read_varint_from_slice(packet, &mut offset)
 }
 
 async fn send_login_disconnect(stream: &mut TcpStream, json_reason: &str) -> std::io::Result<()> {
