@@ -90,6 +90,32 @@ pub fn check_shutdown(
     }
 }
 
+pub fn save_disconnected_clients(
+    clients: Query<(&Position, &Look, &UniqueId), (With<Client>, Added<valence::prelude::Despawned>)>,
+    world_db: Res<WorldDb>,
+) {
+    for (pos, look, uuid) in &clients {
+        let p_data = world::PlayerData {
+            position: (pos.0.x, pos.0.y, pos.0.z),
+            yaw: look.yaw,
+            pitch: look.pitch,
+        };
+
+        let client_uuid = uuid.0;
+        let db_key = format!("player_{}", client_uuid);
+
+        if let Ok(encoded) = postcard::to_allocvec(&p_data) {
+            use std::io::Write;
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            if encoder.write_all(&encoded).is_ok() {
+                if let Ok(compressed) = encoder.finish() {
+                    let _ = world_db.0.insert(db_key, compressed);
+                }
+            }
+        }
+    }
+}
+
 pub fn main() {
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::SeqCst);
@@ -137,7 +163,7 @@ pub fn main() {
             connection_mode: ConnectionMode::Offline, // Internal offline proxy
             callbacks: KrakenCallbacks.into(),
             max_players: server_config.max_players as usize,
-            address: "127.0.0.1:25566".parse().unwrap(),
+            address: format!("127.0.0.1:{}", server_config.server_port + 1).parse().unwrap(),
             ..Default::default()
         })
         .add_plugins(DefaultPlugins.build().disable::<bevy_log::LogPlugin>())
@@ -157,7 +183,8 @@ pub fn main() {
                     check_shutdown,
                 )
                     .chain(),
-                despawn_disconnected_clients,
+                save_disconnected_clients,
+                valence::client::despawn_disconnected_clients,
             ),
         )
         .run();
