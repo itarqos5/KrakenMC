@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write;
 
-use crate::logger::{log_info, log_warn};
+use crate::logger::{log_error, log_info, log_warn};
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -24,7 +24,11 @@ impl Default for ServerConfig {
     }
 }
 
-pub fn ensure_files_exist() -> ServerConfig {
+/// Enforces the EULA gate at the absolute top of bootstrap.
+/// Returns the loaded ServerConfig only if eula=true.
+/// Exits the process immediately if eula.txt is missing or eula=false,
+/// preventing any network listeners or internal game loops from starting.
+pub fn enforce_eula_gate() -> ServerConfig {
     let exe_dir = std::env::current_exe()
         .unwrap()
         .parent()
@@ -36,16 +40,54 @@ pub fn ensure_files_exist() -> ServerConfig {
     let _ = fs::create_dir_all(exe_dir.join("world_nether"));
     let _ = fs::create_dir_all(exe_dir.join("world_the_end"));
 
-    // EULA
     let eula_path = exe_dir.join("eula.txt");
     if !eula_path.exists() {
         log_warn!("eula.txt not found. Creating default...");
         let mut file = fs::File::create(&eula_path).unwrap();
         writeln!(file, "# By changing the setting below to TRUE you are indicating your agreement to our EULA (https://account.mojang.com/documents/minecraft_eula).").unwrap();
-        writeln!(file, "eula=true").unwrap();
+        writeln!(file, "eula=false").unwrap();
+
+        let props_path = exe_dir.join("server.properties");
+        if !props_path.exists() {
+            log_warn!("server.properties not found. Generating default...");
+            let mut file = fs::File::create(&props_path).unwrap();
+            let defaults = ServerConfig::default();
+            writeln!(file, "# Kraken Server Properties").unwrap();
+            writeln!(file, "# Protocol Versions map:").unwrap();
+            writeln!(file, "# 763 = 1.20.1").unwrap();
+            writeln!(file, "# 764 = 1.20.2").unwrap();
+            writeln!(file, "# 765 = 1.20.3").unwrap();
+            writeln!(file, "# 766 = 1.20.4").unwrap();
+            writeln!(file, "# 767 = 1.20.5 / 1.20.6").unwrap();
+            writeln!(file, "# 776 = 1.21.11").unwrap();
+            writeln!(file, "server-ip={}", defaults.server_ip).unwrap();
+            writeln!(file, "server-port={}", defaults.server_port).unwrap();
+            writeln!(file, "target-protocol={}", defaults.target_protocol).unwrap();
+            writeln!(file, "max-players={}", defaults.max_players).unwrap();
+            writeln!(file, "motd={}", defaults.motd).unwrap();
+            log_info!("Created server.properties");
+        }
+
+        log_error!("You must accept the EULA to run this server. Set eula=true in eula.txt.");
+        std::process::exit(0);
     }
 
-    // Properties
+    let contents = fs::read_to_string(&eula_path).unwrap();
+    let mut eula_accepted = false;
+    for line in contents.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("eula=") {
+            eula_accepted = val.trim().eq_ignore_ascii_case("true");
+        }
+    }
+
+    if !eula_accepted {
+        log_error!("You must accept the EULA to run this server. Set eula=true in eula.txt.");
+        std::process::exit(0);
+    }
+
     let mut config = ServerConfig::default();
     let props_path = exe_dir.join("server.properties");
     if !props_path.exists() {
