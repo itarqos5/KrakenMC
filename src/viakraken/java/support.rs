@@ -33,7 +33,7 @@ pub(super) const CONFIG_FINISH_CLIENTBOUND_ID: i32 = 0x03;
 pub(super) const CONFIG_FINISH_SERVERBOUND_ID: i32 = 0x03;
 
 pub(super) fn strict_error_handling(protocol_version: i32) -> bool {
-    protocol_version == 774 || (protocol_version >= 767 && protocol_version < 775)
+    protocol_version >= 767
 }
 
 pub(super) fn is_supported_login_protocol(protocol: i32) -> bool {

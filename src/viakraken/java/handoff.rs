@@ -32,7 +32,7 @@ pub(super) async fn relay_login_handoff(
                 let backend_id = packet_id(&backend_packet)?;
 
                 if backend_id == LOGIN_SUCCESS_ID {
-                    let core = parse_backend_login_success(&backend_packet)?;
+                    let core = parse_backend_login_success(&backend_packet, protocol_version)?;
                     let strict = strict_error_handling(protocol_version);
                     let rebuilt = build_login_success_packet(&core, strict)?;
                     write_framed_payload(client, rebuilt.as_slice()).await?;
@@ -109,7 +109,7 @@ pub(super) async fn relay_login_handoff(
     ))
 }
 
-fn parse_backend_login_success(packet: &[u8]) -> std::io::Result<LoginSuccessCore> {
+fn parse_backend_login_success(packet: &[u8], protocol_version: i32) -> std::io::Result<LoginSuccessCore> {
     let mut offset = 0usize;
     let id = read_varint_from_slice(packet, &mut offset)?;
     if id != LOGIN_SUCCESS_ID {
@@ -157,8 +157,16 @@ fn parse_backend_login_success(packet: &[u8]) -> std::io::Result<LoginSuccessCor
         });
     }
 
-    if offset < packet.len() {
-        let _ = read_bool_from_slice(packet, &mut offset)?;
+    // Protocol 26.1 (775) mandates a trailing strict-error-handling boolean
+    if strict_error_handling(protocol_version) {
+        let _trailing = read_bool_from_slice(packet, &mut offset)?;
+    }
+
+    if offset != packet.len() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("DecoderException: found {} bytes extra", packet.len() - offset),
+        ));
     }
 
     Ok(LoginSuccessCore {
