@@ -1,19 +1,16 @@
 use std::io::{Error, ErrorKind};
 
-use pumpkin_protocol::java::client::config::CFinishConfig;
-use pumpkin_protocol::java::client::login::{CLoginDisconnect, CLoginSuccess};
-use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
-use pumpkin_protocol::java::server::login::SLoginAcknowledged;
-use pumpkin_protocol::Property;
-use pumpkin_util::version::MinecraftVersion;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
 use crate::logger::log_info;
 use crate::viakraken::java::packets::build_login_success_packet;
-use crate::viakraken::java::support::{packet_id_for_version, strict_error_handling};
-use crate::viakraken::java::types::LoginSuccessCore;
+use crate::viakraken::java::support::{
+    strict_error_handling, CONFIG_FINISH_CLIENTBOUND_ID, CONFIG_FINISH_SERVERBOUND_ID,
+    LOGIN_ACKNOWLEDGED_ID, LOGIN_DISCONNECT_ID, LOGIN_SUCCESS_ID,
+};
+use crate::viakraken::java::types::{LoginSuccessCore, Property};
 use crate::viakraken::utils::{
     packet_id, read_bool_from_slice, read_packet, read_string_from_slice, read_varint_from_slice,
     write_framed_payload,
@@ -23,19 +20,8 @@ pub(super) async fn relay_login_handoff(
     client: &mut TcpStream,
     backend: &mut TcpStream,
     protocol_version: i32,
-    version: MinecraftVersion,
     fallback_username: &str,
 ) -> std::io::Result<Option<String>> {
-    let login_success_id =
-        packet_id_for_version::<CLoginSuccess<'static>>(version, "login-success")?;
-    let login_disconnect_id =
-        packet_id_for_version::<CLoginDisconnect>(version, "login-disconnect")?;
-    let login_ack_id = packet_id_for_version::<SLoginAcknowledged>(version, "login-ack")?;
-    let config_finish_clientbound_id =
-        packet_id_for_version::<CFinishConfig>(version, "config-finish-clientbound")?;
-    let config_finish_serverbound_id =
-        packet_id_for_version::<SAcknowledgeFinishConfig>(version, "config-finish-serverbound")?;
-
     let mut player_name: Option<String> = None;
     let mut login_success_forwarded = false;
 
@@ -45,10 +31,10 @@ pub(super) async fn relay_login_handoff(
                 let backend_packet = backend_packet?;
                 let backend_id = packet_id(&backend_packet)?;
 
-                if backend_id == login_success_id {
+                if backend_id == LOGIN_SUCCESS_ID {
                     let core = parse_backend_login_success(&backend_packet)?;
-                    let strict_error_handling = strict_error_handling(protocol_version);
-                    let rebuilt = build_login_success_packet(&core, version, strict_error_handling)?;
+                    let strict = strict_error_handling(protocol_version);
+                    let rebuilt = build_login_success_packet(&core, strict)?;
                     write_framed_payload(client, rebuilt.as_slice()).await?;
 
                     player_name = Some(core.username.clone());
@@ -59,7 +45,7 @@ pub(super) async fn relay_login_handoff(
 
                 write_framed_payload(client, &backend_packet).await?;
 
-                if backend_id == login_disconnect_id {
+                if backend_id == LOGIN_DISCONNECT_ID {
                     return Ok(None);
                 }
             }
@@ -69,7 +55,7 @@ pub(super) async fn relay_login_handoff(
                 let client_id = packet_id(&client_packet)?;
                 write_framed_payload(backend, &client_packet).await?;
 
-                if login_success_forwarded && client_id == login_ack_id {
+                if login_success_forwarded && client_id == LOGIN_ACKNOWLEDGED_ID {
                     log_info!(
                         "Client {} acknowledged login; entering configuration relay",
                         player_name.as_deref().unwrap_or(fallback_username)
@@ -89,10 +75,9 @@ pub(super) async fn relay_login_handoff(
                 let backend_packet = backend_packet?;
                 let backend_id = packet_id(&backend_packet)?;
 
-                // Transparent configuration relay: forward all backend packets as-is.
                 write_framed_payload(client, &backend_packet).await?;
 
-                if backend_id == config_finish_clientbound_id {
+                if backend_id == CONFIG_FINISH_CLIENTBOUND_ID {
                     backend_sent_finish_config = true;
                     if client_sent_finish_config {
                         break;
@@ -104,10 +89,9 @@ pub(super) async fn relay_login_handoff(
                 let client_packet = client_packet?;
                 let client_id = packet_id(&client_packet)?;
 
-                // Transparent configuration relay: forward all client packets as-is.
                 write_framed_payload(backend, &client_packet).await?;
 
-                if client_id == config_finish_serverbound_id {
+                if client_id == CONFIG_FINISH_SERVERBOUND_ID {
                     client_sent_finish_config = true;
                     if backend_sent_finish_config {
                         break;
@@ -128,7 +112,7 @@ pub(super) async fn relay_login_handoff(
 fn parse_backend_login_success(packet: &[u8]) -> std::io::Result<LoginSuccessCore> {
     let mut offset = 0usize;
     let id = read_varint_from_slice(packet, &mut offset)?;
-    if id != 0x02 {
+    if id != LOGIN_SUCCESS_ID {
         return Err(Error::new(
             ErrorKind::InvalidData,
             format!("expected login success packet id 0x02, got 0x{id:02x}"),
@@ -175,13 +159,6 @@ fn parse_backend_login_success(packet: &[u8]) -> std::io::Result<LoginSuccessCor
 
     if offset < packet.len() {
         let _ = read_bool_from_slice(packet, &mut offset)?;
-    }
-
-    if offset != packet.len() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("login success has {} trailing bytes", packet.len() - offset),
-        ));
     }
 
     Ok(LoginSuccessCore {

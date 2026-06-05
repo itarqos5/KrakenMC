@@ -37,7 +37,7 @@ azalea-block = "0.16.0"
 bevy_app = "0.18.1"
 bevy_ecs = "0.18.1"
 uuid = { version = "1.23.1", features = ["v4"] }
-kraken_protocol = { path = "kraken-protocol", features = ["tokio-defaults", "v1_21_11"] }
+kraken_protocol = { path = "kraken-protocol", features = ["tokio-defaults", "v1_21_11", "v26_1"] }
 
 [profile.release]
 lto = true

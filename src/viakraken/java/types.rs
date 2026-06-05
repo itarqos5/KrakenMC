@@ -1,4 +1,3 @@
-use pumpkin_protocol::Property;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -17,4 +16,11 @@ pub(super) struct LoginSuccessCore {
     pub uuid: Uuid,
     pub username: String,
     pub properties: Vec<Property>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct Property {
+    pub name: String,
+    pub value: String,
+    pub signature: Option<String>,
 }
