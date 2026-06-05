@@ -2,7 +2,7 @@ use tokio::net::TcpStream;
 
 use crate::viakraken::java::types::LoginSuccessCore;
 use crate::viakraken::utils::{
-    json_escape, write_framed_payload, write_string, write_varint, write_varint_buffer, ByteBuffer,
+    json_escape, write_framed_payload, write_string, write_varint_buffer, ByteBuffer,
 };
 
 pub(super) fn build_login_success_packet(
@@ -34,15 +34,15 @@ pub(super) fn build_login_success_packet(
             let mut sig_buf = Vec::new();
             write_string(&mut sig_buf, sig)?;
             let mut entry = Vec::new();
-            write_varint(&mut entry, 1); // has_signature = true
+            entry.push(1); // has_signature = true
             entry.extend_from_slice(&sig_buf);
             payload.extend_from_slice(&entry);
         } else {
-            write_varint_buffer(&mut payload, 0); // has_signature = false
+            payload.push(0); // has_signature = false
         }
     }
     // Strict error handling flag
-    write_varint_buffer(&mut payload, if strict_error_handling { 1 } else { 0 });
+    payload.push(if strict_error_handling { 1 } else { 0 });
     Ok(payload)
 }
 
