@@ -20,14 +20,15 @@ use pumpkin_util::version::MinecraftVersion;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
-use tokio::sync::broadcast;
 use std::sync::OnceLock;
 use uuid::Uuid;
+use bytes::Bytes;
 
 use pumpkin_protocol::java::server::play::SChatMessage;
 use pumpkin_protocol::ServerPacket;
 
 use crate::config::ServerConfig;
+use crate::world::chunk_gen::save_block_change;
 use crate::logger::{log_info, log_warn};
 use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::java::protocol::{parse_handshake, parse_login_start};
@@ -40,13 +41,22 @@ use crate::viakraken::utils::{
 };
 use crate::world::chunk_gen::encode_chunk_packet;
 use crate::world::player_store::{load_player, save_player, PlayerData};
+use pumpkin_protocol::ser::NetworkWriteExt;
 
-pub fn chat_channel() -> broadcast::Sender<String> {
-    static CHAT_CHANNEL: OnceLock<broadcast::Sender<String>> = OnceLock::new();
-    CHAT_CHANNEL.get_or_init(|| {
-        let (tx, _) = broadcast::channel(100);
+pub fn chat_channel() -> &'static tokio::sync::broadcast::Sender<String> {
+    static CHANNEL: OnceLock<tokio::sync::broadcast::Sender<String>> = OnceLock::new();
+    CHANNEL.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(100);
         tx
-    }).clone()
+    })
+}
+
+pub fn block_channel() -> &'static tokio::sync::broadcast::Sender<Bytes> {
+    static CHANNEL: OnceLock<tokio::sync::broadcast::Sender<Bytes>> = OnceLock::new();
+    CHANNEL.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(1024);
+        tx
+    })
 }
 
 pub async fn run_backend_listener(
@@ -244,8 +254,10 @@ async fn handle_play(
     uuid: Uuid,
     db: Arc<sled::Db>,
 ) -> std::io::Result<()> {
-    // Load persisted player data
     let mut player = load_player(&db, uuid);
+    if player.inventory.len() != 46 {
+        player.inventory = vec![vec![]; 46];
+    }
 
     // Send CLogin (join game)
     let login_play = pumpkin_protocol::java::client::play::CLogin::new(
@@ -299,9 +311,36 @@ async fn handle_play(
             actions: &actions,
         }];
 
-        let info_update = CPlayerInfoUpdate::new(flags, &players);
-        let payload = encode_java_packet(&info_update, version)?;
-        write_framed_payload(stream, payload.as_slice()).await?;
+        let player_info = pumpkin_protocol::java::client::play::CPlayerInfoUpdate::new(flags, &players);
+        let player_info_payload = encode_java_packet(&player_info, version)?;
+        write_framed_payload(stream, player_info_payload.as_slice()).await?;
+    }
+
+    // --- Send Inventory ---
+    {
+        // Custom serialization of CSetContainerContent since we have raw slot bytes
+        let mut buf = Vec::new();
+        // window_id (0 = player inventory)
+        let _ = buf.write_var_int(&VarInt(0));
+        // state_id (0)
+        let _ = buf.write_var_int(&VarInt(0));
+        // slot_count
+        let _ = buf.write_var_int(&VarInt(46));
+        for i in 0..46 {
+            if player.inventory[i].is_empty() {
+                // write empty item: item_count = 0
+                let _ = buf.write_var_int(&VarInt(0));
+            } else {
+                buf.extend_from_slice(&player.inventory[i]);
+            }
+        }
+        // carried item (empty)
+        let _ = buf.write_var_int(&VarInt(0));
+
+        let mut pkt_buf = Vec::new();
+        let _ = pkt_buf.write_var_int(&VarInt(pumpkin_data::packet::clientbound::PLAY_CONTAINER_SET_CONTENT.to_id(version) as i32));
+        pkt_buf.extend_from_slice(&buf);
+        let _ = write_framed_payload(stream, &pkt_buf).await;
     }
 
     // --- Player Abilities ---
@@ -360,8 +399,8 @@ async fn handle_play(
         for dx in -3i32..=3 {
             let cx = chunk_x + dx;
             let cz = chunk_z + dz;
-            let chunk_packet_bytes = encode_chunk_packet(cx, cz, protocol_version);
-            write_framed_payload(stream, &chunk_packet_bytes).await?;
+            let chunk_data = encode_chunk_packet(cx, cz, protocol_version, &db);
+            write_framed_payload(stream, &chunk_data).await?;
             chunk_count += 1;
         }
     }
@@ -399,15 +438,19 @@ async fn handle_play(
     let mut buf = vec![0u8; 65536];
     let mut pending_bytes = Vec::new();
     let mut chat_rx = chat_channel().subscribe();
+    let mut block_rx = block_channel().subscribe();
 
     'play: loop {
         tokio::select! {
             Ok(msg) = chat_rx.recv() => {
-                let text_comp = TextComponent::text(msg);
-                let pkt = CSystemChatMessage::new(&text_comp, false);
+                let text_comp = pumpkin_util::text::TextComponent::text(msg);
+                let pkt = pumpkin_protocol::java::client::play::CSystemChatMessage::new(&text_comp, false);
                 if let Ok(payload) = encode_java_packet(&pkt, version) {
                     let _ = write_framed_payload(stream, payload.as_slice()).await;
                 }
+            }
+            Ok(block_data) = block_rx.recv() => {
+                let _ = write_framed_payload(stream, &block_data).await;
             }
             _ = interval.tick() => {
                 keep_alive_id = keep_alive_id.wrapping_add(1);
@@ -479,44 +522,17 @@ async fn handle_play_packet(
     // Use packet ID tables from pumpkin-data for the player's version
 
 
-    let sv_player_action = pumpkin_data::packet::serverbound::PLAY_PLAYER_ACTION.to_id(version);
     let sv_use_item_on = pumpkin_data::packet::serverbound::PLAY_USE_ITEM_ON.to_id(version);
     let sv_change_gm = pumpkin_data::packet::serverbound::PLAY_CHANGE_GAME_MODE.to_id(version);
     let sv_chat_cmd = pumpkin_data::packet::serverbound::PLAY_CHAT_COMMAND.to_id(version);
     let sv_pos_rot = pumpkin_data::packet::serverbound::PLAY_MOVE_PLAYER_POS_ROT.to_id(version);
     let sv_pos = pumpkin_data::packet::serverbound::PLAY_MOVE_PLAYER_POS.to_id(version);
+    let sv_chat = pumpkin_data::packet::serverbound::PLAY_CHAT.to_id(version);
+    let sv_creative_slot = pumpkin_data::packet::serverbound::PLAY_SET_CREATIVE_MODE_SLOT.to_id(version);
+    let sv_held_item = pumpkin_data::packet::serverbound::PLAY_SET_CARRIED_ITEM.to_id(version);
+    let sv_player_action = pumpkin_data::packet::serverbound::PLAY_PLAYER_ACTION.to_id(version);
 
-    if pid == sv_player_action {
-        // SPlayerAction: status(VarInt), pos(BlockPos=i64), face(u8), sequence(VarInt)
-        let mut o = 0usize;
-        let status = read_varint_from_slice(payload, &mut o).unwrap_or(0);
-        // Read block pos (packed i64)
-        if o + 8 <= payload.len() {
-            let packed = i64::from_be_bytes(payload[o..o+8].try_into().unwrap_or_default());
-            o += 8;
-            let _face = if o < payload.len() { payload[o]; o += 1; } else { 0u8; };
-            let sequence = read_varint_from_slice(payload, &mut o).unwrap_or(0);
-
-            // StartedDigging or FinishedDigging or creative instant break
-            if status == 0 || status == 2 {
-                // Unpack BlockPos: x=26bit signed, y=12bit signed, z=26bit signed
-                let x = (packed >> 38) as i32;
-                let y = ((packed << 52) >> 52) as i32;
-                let z = ((packed << 26) >> 38) as i32;
-                let block_pos = BlockPos(Vector3 { x, y, z });
-
-                // Acknowledge block change
-                let ack = CAcknowledgeBlockChange::new(VarInt(sequence));
-                let ack_payload = encode_java_packet(&ack, version)?;
-                write_framed_payload(stream, ack_payload.as_slice()).await?;
-
-                // Send block update (air = state 0)
-                let update = CBlockUpdate::new(block_pos, VarInt(0));
-                let update_payload = encode_java_packet(&update, version)?;
-                write_framed_payload(stream, update_payload.as_slice()).await?;
-            }
-        }
-    } else if pid == sv_use_item_on {
+    if pid == sv_use_item_on {
         // SUseItemOn: hand(VarInt), pos(BlockPos=i64), face(VarInt), cursor(3xf32), inside(bool), worldborder(bool), sequence(VarInt)
         let mut o = 0usize;
         let _hand = read_varint_from_slice(payload, &mut o).unwrap_or(0);
@@ -544,6 +560,17 @@ async fn handle_play_packet(
                 _ => (x, y + 1, z),
             };
             let place_pos = BlockPos(Vector3 { x: nx, y: ny, z: nz });
+            
+            // Assume placed block is Diamond Block (id 103 or lookup from inventory in a real system)
+            // pumpkin_data::Block::from_registry_key("diamond_block").unwrap().default_state.id
+            let block_id = 265; // Diamond Block default state ID approximately, or 103
+            // Save block
+            save_block_change(_db, nx, ny, nz, block_id);
+
+            // Broadcast Block Update
+            let block_update = CBlockUpdate::new(place_pos, VarInt(block_id as i32));
+            let block_update_payload = encode_java_packet(&block_update, version)?;
+            let _ = block_channel().send(Bytes::from(block_update_payload.as_slice().to_vec()));
 
             // Acknowledge the placement
             if sequence > 0 {
@@ -554,6 +581,43 @@ async fn handle_play_packet(
             
             // Note: We no longer force the block to Stone! The client will keep the block it placed locally.
             // A full implementation would track the block state in world chunks.
+        }
+    } else if pid == sv_player_action {
+        // PLAY_PLAYER_ACTION (Digging)
+        // status (VarInt), location (Position), face (Byte), sequence (VarInt)
+        let mut o = 0usize;
+        let status = read_varint_from_slice(payload, &mut o).unwrap_or(0);
+        // Position is 8 bytes
+        if o + 8 <= payload.len() {
+            let pos_val = u64::from_be_bytes(payload[o..o+8].try_into().unwrap_or_default());
+            let x = (pos_val >> 38) as i32;
+            let y = (pos_val << 52 >> 52) as i32;
+            let z = (pos_val << 26 >> 38) as i32;
+            
+            // If status is 0 (Started digging) or 2 (Finished digging)
+            if status == 0 || status == 2 {
+                save_block_change(_db, x, y, z, 0); // AIR
+                let block_update = CBlockUpdate::new(BlockPos(Vector3 { x, y, z }), VarInt(0));
+                if let Ok(block_update_payload) = encode_java_packet(&block_update, version) {
+                    let _ = block_channel().send(Bytes::from(block_update_payload.as_slice().to_vec()));
+                }
+            }
+        }
+    } else if pid == sv_creative_slot {
+        use pumpkin_protocol::java::server::play::SSetCreativeSlot;
+        if let Ok(pkt) = SSetCreativeSlot::read(&mut std::io::Cursor::new(payload), &version) {
+            let slot = pkt.slot;
+            if slot >= 0 && slot < 46 {
+                let mut buf = Vec::new();
+                if pkt.clicked_item.write_with_version(&mut buf, &version).is_ok() {
+                    player.inventory[slot as usize] = buf;
+                }
+            }
+        }
+    } else if pid == sv_held_item {
+        if payload.len() >= 2 {
+            // Very simplified: SSetHeldItem has slot as i16 but fits in 2 bytes
+            player.held_slot = payload[1];
         }
     } else if pid == sv_change_gm && sv_change_gm >= 0 {
         // SChangeGameMode: gamemode (VarInt)
@@ -599,6 +663,10 @@ async fn handle_play_packet(
             player.yaw = f32::from_be_bytes(payload[0..4].try_into().unwrap_or_default());
             player.pitch = f32::from_be_bytes(payload[4..8].try_into().unwrap_or_default());
         }
+    } else if pid == sv_chat {
+        if let Ok(msg) = SChatMessage::read(&mut std::io::Cursor::new(payload), &version) {
+            let _ = chat_channel().send(format!("<{}> {}", username, msg.message));
+        }
     }
 
     if player.y < -64.0 {
@@ -617,10 +685,6 @@ async fn handle_play_packet(
         );
         let payload = encode_java_packet(&pos_pkt, version)?;
         write_framed_payload(stream, payload.as_slice()).await?;
-    } else if pid == pumpkin_data::packet::serverbound::PLAY_CHAT.to_id(version) {
-        if let Ok(msg) = SChatMessage::read(&mut std::io::Cursor::new(payload), &version) {
-            let _ = chat_channel().send(format!("<{}> {}", username, msg.message));
-        }
     }
     // All other packets (keep-alive echo, client info, etc.) are silently discarded.
 

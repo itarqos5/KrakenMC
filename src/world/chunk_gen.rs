@@ -20,9 +20,41 @@ fn write_vi(buf: &mut Vec<u8>, value: i32) {
     }
 }
 
-/// Build the raw PLAY_LEVEL_CHUNK_WITH_LIGHT packet payload for a single chunk.
-/// This is hand-crafted wire format for protocol 774/775.
-pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32) -> Vec<u8> {
+use std::collections::HashMap;
+use std::sync::Arc;
+
+pub fn save_block_change(db: &Arc<sled::Db>, x: i32, y: i32, z: i32, state_id: u16) {
+    let chunk_x = x >> 4;
+    let chunk_z = z >> 4;
+    let tree = db.open_tree("chunk_mods").unwrap();
+    let key = format!("{},{}", chunk_x, chunk_z);
+    
+    let mut mods = get_chunk_mods(db, chunk_x, chunk_z);
+    let lx = (x & 15) as u16;
+    let lz = (z & 15) as u16;
+    // Section Y: -4 to 19 (for -64 to 319)
+    let sy = (y - MIN_Y) as u16;
+    let idx = sy * 256 + lz * 16 + lx;
+    mods.insert(idx, state_id);
+    
+    if let Ok(bytes) = postcard::to_allocvec(&mods) {
+        let _ = tree.insert(key.as_bytes(), bytes);
+    }
+}
+
+pub fn get_chunk_mods(db: &Arc<sled::Db>, chunk_x: i32, chunk_z: i32) -> HashMap<u16, u16> {
+    if let Ok(tree) = db.open_tree("chunk_mods") {
+        let key = format!("{},{}", chunk_x, chunk_z);
+        if let Ok(Some(bytes)) = tree.get(key.as_bytes()) {
+            if let Ok(mods) = postcard::from_bytes::<HashMap<u16, u16>>(&bytes) {
+                return mods;
+            }
+        }
+    }
+    HashMap::new()
+}
+
+pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32, db: &Arc<sled::Db>) -> Vec<u8> {
     let perlin = Perlin::new(42);
     // Precompute surface height for each column (0..16, 0..16)
     let mut surface_y = [[0i32; 16]; 16];
@@ -87,8 +119,10 @@ pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32) ->
     let stone_id = pumpkin_data::Block::from_name("stone").unwrap().default_state.id;
     let dirt_id = pumpkin_data::Block::from_name("dirt").unwrap().default_state.id;
     let grass_id = pumpkin_data::Block::from_name("grass_block").unwrap().default_state.id;
-    let deepslate_id = pumpkin_data::Block::from_name("deepslate").unwrap().default_state.id;
+    let deepslate_id = pumpkin_data::Block::from_registry_key("deepslate").unwrap().default_state.id;
     const PLAINS_BIOME: u16 = 1;
+
+    let mods = get_chunk_mods(db, chunk_x, chunk_z);
 
     let mut sections_buf: Vec<u8> = Vec::new();
     for section_idx in 0..SECTION_COUNT {
@@ -101,8 +135,15 @@ pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32) ->
                 let surf = surface_y[bx][bz];
                 for by in 0..SECTION_HEIGHT {
                     let world_y = section_base_y + by as i32;
+                    let lx = bx as u16;
+                    let lz = bz as u16;
+                    let sy = (world_y - MIN_Y) as u16;
+                    let global_idx = sy * 256 + lz * 16 + lx;
                     let idx = by * CHUNK_WIDTH * CHUNK_WIDTH + bz * CHUNK_WIDTH + bx;
-                    let block = if world_y < 0 {
+                    
+                    let block = if let Some(&mod_id) = mods.get(&global_idx) {
+                        mod_id
+                    } else if world_y < 0 {
                         deepslate_id
                     } else if world_y < surf - 3 {
                         stone_id
