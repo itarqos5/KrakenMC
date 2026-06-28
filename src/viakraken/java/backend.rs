@@ -3,10 +3,13 @@ use std::sync::Arc;
 
 use pumpkin_protocol::java::client::config::{CFinishConfig, CKnownPacks, CRegistryData, RegistryEntry, CUpdateTags};
 use pumpkin_protocol::java::client::login::CLoginSuccess;
+use pumpkin_protocol::java::client::play::CLogin;
 use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
 use pumpkin_protocol::java::server::login::SLoginAcknowledged;
 use pumpkin_protocol::{KnownPack, Property};
+use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_util::version::MinecraftVersion;
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
@@ -24,7 +27,7 @@ use crate::viakraken::utils::{
     write_packet, write_string,
 };
 
-const NATIVE_PROTOCOL: i32 = 776;
+const NATIVE_PROTOCOL: i32 = 775;
 
 pub async fn run_backend_listener(
     listener: TcpListener,
@@ -78,13 +81,8 @@ async fn handle_status(
     }
 
     let motd = json_escape(&config.motd);
-    let advertised_protocol = if protocol_version == NATIVE_PROTOCOL {
-        NATIVE_PROTOCOL
-    } else {
-        protocol_version
-    };
-
     let is_supported = is_supported_login_protocol(protocol_version) || protocol_version == NATIVE_PROTOCOL;
+
     let name = match protocol_version {
         766 => "1.20.5".to_string(),
         767 => "1.21".to_string(),
@@ -100,10 +98,11 @@ async fn handle_status(
             }
         }
     };
-    let ver_name = if is_supported {
-        name
+
+    let (ver_name, advertised_protocol) = if is_supported {
+        (name, protocol_version)
     } else {
-        format!("Kraken {}", name)
+        (format!("Kraken {}", name), NATIVE_PROTOCOL)
     };
 
     let status_json = format!(
@@ -237,7 +236,37 @@ async fn handle_login(
             "Did not receive config-finish from {}; transition to Play not confirmed",
             username
         );
+        return Ok(());
     }
+
+    let login_play = CLogin::new(
+        1, // entity_id
+        false, // is_hardcore
+        vec![
+            "minecraft:overworld".to_string(),
+            "minecraft:the_nether".to_string(),
+            "minecraft:the_end".to_string(),
+        ], // dimension_names
+        VarInt(100), // max_players
+        VarInt(10), // view_distance
+        VarInt(10), // simulated_distance
+        false, // reduced_debug_info
+        true, // enabled_respawn_screen
+        false, // limited_crafting
+        pumpkin_data::dimension::Dimension::OVERWORLD, // dimension
+        42, // hashed_seed
+        1, // game_mode: Creative
+        -1, // previous_gamemode
+        false, // debug
+        false, // is_flat
+        None, // death_dimension_name
+        VarInt(0), // portal_cooldown
+        VarInt(63), // sealevel
+        true, // enforce_secure_chat
+    );
+
+    let login_play_payload = encode_java_packet(&login_play, version)?;
+    write_framed_payload(stream, login_play_payload.as_slice()).await?;
 
     log_info!(
         "Login flow completed for {} (protocol={}, max_players={})",
@@ -245,5 +274,15 @@ async fn handle_login(
         protocol_version,
         config.max_players
     );
+
+    loop {
+        let mut buf = [0u8; 1024];
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
     Ok(())
 }
