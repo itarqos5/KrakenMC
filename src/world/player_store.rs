@@ -17,7 +17,11 @@ pub struct PlayerData {
     pub highest_y: f64,
     #[serde(default)]
     pub held_slot: u8,
+    #[serde(default = "default_health")]
+    pub health: f32,
 }
+
+fn default_health() -> f32 { 20.0 }
 
 impl Default for PlayerData {
     fn default() -> Self {
@@ -31,6 +35,7 @@ impl Default for PlayerData {
             inventory: vec![Vec::new(); 46],
             highest_y: 70.0,
             held_slot: 0,
+            health: 20.0,
         }
     }
 }

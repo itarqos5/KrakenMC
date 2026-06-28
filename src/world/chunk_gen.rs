@@ -143,6 +143,15 @@ pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32, db
                     
                     let block = if let Some(&mod_id) = mods.get(&global_idx) {
                         mod_id
+                    } else if world_y == -64 {
+                        pumpkin_data::Block::from_registry_key("bedrock").unwrap().default_state.id
+                    } else if world_y == -63 {
+                        let h = ((chunk_x as i64 * 341873128712i64) ^ (chunk_z as i64 * 132897987541i64) ^ (bx as i64 * 91823) ^ (bz as i64 * 81923)).abs();
+                        if (h % 100) < 50 {
+                            pumpkin_data::Block::from_registry_key("bedrock").unwrap().default_state.id
+                        } else {
+                            pumpkin_data::Block::from_registry_key("deepslate").unwrap().default_state.id
+                        }
                     } else if world_y < 0 {
                         deepslate_id
                     } else if world_y < surf - 3 {

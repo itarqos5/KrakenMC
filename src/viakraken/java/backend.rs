@@ -261,32 +261,66 @@ async fn handle_play(
 
     // Send CLogin (join game)
     let login_play = pumpkin_protocol::java::client::play::CLogin::new(
-        1, // entity_id
-        false,
-        vec![
-            "minecraft:overworld".to_string(),
-            "minecraft:the_nether".to_string(),
-            "minecraft:the_end".to_string(),
-        ],
-        VarInt(config.max_players as i32),
-        VarInt(3),
-        VarInt(3),
-        false,
-        true,
-        false,
-        pumpkin_data::dimension::Dimension::OVERWORLD,
-        42,
-        player.gamemode,
-        -1,
-        false,
-        false,
-        None,
-        VarInt(0),
-        VarInt(63),
-        true,
+        0, // Entity ID
+        false, // hardcore
+        vec!["minecraft:overworld".to_string()], // dimensions
+        VarInt(3), // max players
+        VarInt(8), // view distance
+        VarInt(8), // sim distance
+        false, // reduced debug info
+        true, // enable respawn screen
+        false, // do limited crafting
+        pumpkin_data::dimension::Dimension::OVERWORLD, // dimension type
+        player.x as i64, // hashed seed (mock)
+        player.gamemode, // game type (survival=0, creative=1, adventure=2, spectator=3)
+        1, // previous game type
+        false, // is debug
+        true, // is flat
+        None, // death location
+        VarInt(0), // portal cooldown
+        VarInt(63), // sealevel
+        false, // enforces secure chat
     );
     let login_play_payload = encode_java_packet(&login_play, version)?;
     write_framed_payload(stream, login_play_payload.as_slice()).await?;
+
+    // --- Send Commands Autocompletion ---
+    {
+        use pumpkin_protocol::java::client::play::{CCommands, ProtoNode, ProtoNodeType, ArgumentType, StringProtoArgBehavior};
+        // Very basic tree: 
+        // 0: Root
+        // 1: Literal "gamemode"
+        // 2: Argument "mode" (String)
+        let nodes = vec![
+            ProtoNode {
+                children: vec![VarInt(1)].into_boxed_slice(),
+                node_type: ProtoNodeType::Root,
+            },
+            ProtoNode {
+                children: vec![VarInt(2)].into_boxed_slice(),
+                node_type: ProtoNodeType::Literal {
+                    name: "gamemode",
+                    is_executable: false,
+                    redirect_target: None,
+                    restricted: false,
+                },
+            },
+            ProtoNode {
+                children: vec![].into_boxed_slice(),
+                node_type: ProtoNodeType::Argument {
+                    name: "mode",
+                    is_executable: true,
+                    redirect_target: None,
+                    parser: ArgumentType::String(StringProtoArgBehavior::SingleWord),
+                    override_suggestion_type: None,
+                    restricted: false,
+                },
+            }
+        ];
+        let cmds = CCommands::new(nodes.into_boxed_slice(), VarInt(0));
+        let cmds_payload = encode_java_packet(&cmds, version)?;
+        write_framed_payload(stream, cmds_payload.as_slice()).await?;
+    }
 
     // --- Player Info Update: add self to tablist ---
     {
@@ -314,6 +348,14 @@ async fn handle_play(
         let player_info = pumpkin_protocol::java::client::play::CPlayerInfoUpdate::new(flags, &players);
         let player_info_payload = encode_java_packet(&player_info, version)?;
         write_framed_payload(stream, player_info_payload.as_slice()).await?;
+    }
+
+    // --- Send Health ---
+    {
+        use pumpkin_protocol::java::client::play::CSetHealth;
+        let hp = CSetHealth::new(player.health, VarInt(20), 20.0);
+        let hp_payload = encode_java_packet(&hp, version)?;
+        write_framed_payload(stream, hp_payload.as_slice()).await?;
     }
 
     // --- Send Inventory ---
@@ -508,7 +550,7 @@ async fn handle_play_packet(
     pkt_data: &[u8],
     player: &mut PlayerData,
     username: &str,
-    _uuid: Uuid,
+    uuid: Uuid,
     _db: &Arc<sled::Db>,
 ) -> std::io::Result<()> {
     if pkt_data.is_empty() {
@@ -561,11 +603,26 @@ async fn handle_play_packet(
             };
             let place_pos = BlockPos(Vector3 { x: nx, y: ny, z: nz });
             
-            // Assume placed block is Diamond Block (id 103 or lookup from inventory in a real system)
-            // pumpkin_data::Block::from_registry_key("diamond_block").unwrap().default_state.id
-            let block_id = 265; // Diamond Block default state ID approximately, or 103
+            // Resolve block ID from held item
+            let mut block_id = 265; // default Oak Leaves
+            if player.held_slot < 9 {
+                let inventory_idx = player.held_slot as usize + 36; // Hotbar offset
+                if inventory_idx < player.inventory.len() && !player.inventory[inventory_idx].is_empty() {
+                    let mut cur = 0;
+                    if let Ok(item_count) = crate::viakraken::utils::read_varint_from_slice(&player.inventory[inventory_idx], &mut cur) {
+                        if item_count > 0 {
+                            if let Ok(item_id) = crate::viakraken::utils::read_varint_from_slice(&player.inventory[inventory_idx], &mut cur) {
+                                if let Some(block) = pumpkin_data::Block::from_item_id(item_id as u16) {
+                                    block_id = block.default_state.id as i32;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Save block
-            save_block_change(_db, nx, ny, nz, block_id);
+            save_block_change(_db, nx, ny, nz, block_id as u16);
 
             // Broadcast Block Update
             let block_update = CBlockUpdate::new(place_pos, VarInt(block_id as i32));
@@ -589,10 +646,10 @@ async fn handle_play_packet(
         let status = read_varint_from_slice(payload, &mut o).unwrap_or(0);
         // Position is 8 bytes
         if o + 8 <= payload.len() {
-            let pos_val = u64::from_be_bytes(payload[o..o+8].try_into().unwrap_or_default());
+            let pos_val = i64::from_be_bytes(payload[o..o+8].try_into().unwrap_or_default());
             let x = (pos_val >> 38) as i32;
-            let y = (pos_val << 52 >> 52) as i32;
-            let z = (pos_val << 26 >> 38) as i32;
+            let y = ((pos_val << 52) >> 52) as i32;
+            let z = ((pos_val << 26) >> 38) as i32;
             
             // If status is 0 (Started digging) or 2 (Finished digging)
             if status == 0 || status == 2 {
@@ -622,9 +679,8 @@ async fn handle_play_packet(
     } else if pid == sv_change_gm && sv_change_gm >= 0 {
         // SChangeGameMode: gamemode (VarInt)
         let mut o = 0usize;
-        let gm = read_varint_from_slice(payload, &mut o).unwrap_or(0) as u8;
-        change_gamemode(stream, version, player, gm).await?;
-        log_info!("{} changed gamemode to {}", username, gm);
+        let gm_id = read_varint_from_slice(payload, &mut o).unwrap_or(0);
+        change_gamemode(stream, version, player, uuid, gm_id as u8).await?;
     } else if pid == sv_chat_cmd {
         // SChatCommand: command (String)
         let mut o = 0usize;
@@ -632,7 +688,7 @@ async fn handle_play_packet(
         let cmd_len = read_varint_from_slice(payload, &mut o).unwrap_or(0) as usize;
         if o + cmd_len <= payload.len() {
             if let Ok(cmd) = std::str::from_utf8(&payload[o..o + cmd_len]) {
-                handle_command(stream, version, player, cmd, username).await?;
+                handle_command(stream, version, player, uuid, cmd, username).await?;
             }
         }
     } else if pid == sv_pos_rot {
@@ -695,6 +751,7 @@ async fn change_gamemode(
     stream: &mut TcpStream,
     version: MinecraftVersion,
     player: &mut PlayerData,
+    uuid: Uuid,
     gm: u8,
 ) -> std::io::Result<()> {
     player.gamemode = gm;
@@ -710,6 +767,19 @@ async fn change_gamemode(
     let payload = encode_java_packet(&abilities, version)?;
     write_framed_payload(stream, payload.as_slice()).await?;
 
+    // Send CPlayerInfoUpdate to update gamemode in tablist (allows spectator phasing client-side)
+    use pumpkin_protocol::java::client::play::{CPlayerInfoUpdate, PlayerInfoFlags, PlayerAction, Player};
+    let actions = vec![
+        PlayerAction::UpdateGameMode(VarInt(gm as i32)),
+    ];
+    let players = vec![Player {
+        uuid: uuid,
+        actions: &actions,
+    }];
+    let info_update = CPlayerInfoUpdate::new(PlayerInfoFlags::UPDATE_GAME_MODE.bits(), &players);
+    let payload = encode_java_packet(&info_update, version)?;
+    write_framed_payload(stream, payload.as_slice()).await?;
+
     Ok(())
 }
 
@@ -717,33 +787,30 @@ async fn handle_command(
     stream: &mut TcpStream,
     version: MinecraftVersion,
     player: &mut PlayerData,
+    uuid: Uuid,
     cmd: &str,
     username: &str,
 ) -> std::io::Result<()> {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
-    if parts.is_empty() {
-        return Ok(());
-    }
-
-    match parts[0] {
-        "gamemode" | "gm" if parts.len() >= 2 => {
-            let gm = match parts[1] {
-                "survival" | "s" | "0" => Some(0u8),
-                "creative" | "c" | "1" => Some(1u8),
-                "adventure" | "a" | "2" => Some(2u8),
-                "spectator" | "sp" | "3" => Some(3u8),
+    if !parts.is_empty() {
+        if parts[0] == "gamemode" && parts.len() > 1 {
+            let gm_name = parts[1].to_lowercase();
+            let new_gm = match gm_name.as_str() {
+                "survival" | "0" => Some(0),
+                "creative" | "1" => Some(1),
+                "adventure" | "2" => Some(2),
+                "spectator" | "3" => Some(3),
                 _ => None,
             };
-            if let Some(gm_id) = gm {
-                change_gamemode(stream, version, player, gm_id).await?;
-                let msg_text = format!("Game mode changed to {}", parts[1]);
+            if let Some(gm) = new_gm {
+                change_gamemode(stream, version, player, uuid, gm).await?;
+                let msg_text = format!("Set own game mode to {} Mode", parts[1]);
                 send_system_message(stream, version, &msg_text).await?;
                 log_info!("{}: /gamemode {}", username, parts[1]);
             } else {
                 send_system_message(stream, version, "Unknown gamemode. Use: survival, creative, adventure, spectator").await?;
             }
-        }
-        _ => {
+        } else {
             send_system_message(stream, version, &format!("Unknown command: /{}", cmd)).await?;
         }
     }
@@ -759,10 +826,28 @@ async fn process_fall_damage(
     if on_ground {
         let fall_dist = player.highest_y - player.y;
         if fall_dist > 3.0 && player.gamemode == 0 { // Survival mode only
+            // Calculate damage
+            let damage = (fall_dist - 3.0).ceil() as f32;
+            player.health -= damage;
+            
             // Send damage animation (entity status 2)
             let status = CEntityStatus::new(1, 2);
             let payload = encode_java_packet(&status, version)?;
             write_framed_payload(stream, payload.as_slice()).await?;
+
+            use pumpkin_protocol::java::client::play::CSetHealth;
+            if player.health <= 0.0 {
+                player.health = 0.0;
+                // Update health to 0 (shows death screen)
+                let hp = CSetHealth::new(player.health, VarInt(20), 20.0);
+                let hp_payload = encode_java_packet(&hp, version)?;
+                write_framed_payload(stream, hp_payload.as_slice()).await?;
+            } else {
+                // Update health normally
+                let hp = CSetHealth::new(player.health, VarInt(20), 20.0);
+                let hp_payload = encode_java_packet(&hp, version)?;
+                write_framed_payload(stream, hp_payload.as_slice()).await?;
+            }
         }
         player.highest_y = player.y;
     } else {
