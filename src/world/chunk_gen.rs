@@ -1,4 +1,4 @@
-﻿use noise::{NoiseFn, Perlin};
+use noise::{NoiseFn, Perlin};
 use pumpkin_util::version::MinecraftVersion;
 
 /// Number of block sections in the overworld (-64..320 = 384 blocks high = 24 sections)
@@ -83,17 +83,18 @@ pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32) ->
     }
 
     // === Chunk sections data ===
-    const AIR: u16 = 0;
-    const STONE: u16 = 1;
-    const DIRT: u16 = 78;       // approximate
-    const GRASS: u16 = 9;       // approximate
-    const PLAINS_BIOME: u16 = 39;
+    let air_id = pumpkin_data::Block::AIR.default_state.id;
+    let stone_id = pumpkin_data::Block::from_name("stone").unwrap().default_state.id;
+    let dirt_id = pumpkin_data::Block::from_name("dirt").unwrap().default_state.id;
+    let grass_id = pumpkin_data::Block::from_name("grass_block").unwrap().default_state.id;
+    let deepslate_id = pumpkin_data::Block::from_name("deepslate").unwrap().default_state.id;
+    const PLAINS_BIOME: u16 = 1;
 
     let mut sections_buf: Vec<u8> = Vec::new();
     for section_idx in 0..SECTION_COUNT {
         let section_base_y = MIN_Y + (section_idx as i32) * SECTION_HEIGHT as i32;
 
-        let mut blocks = [AIR; CHUNK_WIDTH * CHUNK_WIDTH * SECTION_HEIGHT];
+        let mut blocks = vec![air_id; CHUNK_WIDTH * CHUNK_WIDTH * SECTION_HEIGHT];
         let mut non_air_count = 0i16;
         for bx in 0..CHUNK_WIDTH {
             for bz in 0..CHUNK_WIDTH {
@@ -101,17 +102,19 @@ pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32) ->
                 for by in 0..SECTION_HEIGHT {
                     let world_y = section_base_y + by as i32;
                     let idx = by * CHUNK_WIDTH * CHUNK_WIDTH + bz * CHUNK_WIDTH + bx;
-                    let block = if world_y < surf - 3 {
-                        STONE
+                    let block = if world_y < 0 {
+                        deepslate_id
+                    } else if world_y < surf - 3 {
+                        stone_id
                     } else if world_y < surf {
-                        DIRT
+                        dirt_id
                     } else if world_y == surf {
-                        GRASS
+                        grass_id
                     } else {
-                        AIR
+                        air_id
                     };
                     blocks[idx] = block;
-                    if block != AIR {
+                    if block != air_id {
                         non_air_count += 1;
                     }
                 }

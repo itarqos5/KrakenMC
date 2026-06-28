@@ -12,6 +12,11 @@ pub struct PlayerData {
     pub pitch: f32,
     /// 0=survival 1=creative 2=adventure 3=spectator
     pub gamemode: u8,
+    pub inventory: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub highest_y: f64,
+    #[serde(default)]
+    pub held_slot: u8,
 }
 
 impl Default for PlayerData {
@@ -23,6 +28,9 @@ impl Default for PlayerData {
             yaw: 0.0,
             pitch: 0.0,
             gamemode: 1, // creative by default
+            inventory: vec![Vec::new(); 46],
+            highest_y: 70.0,
+            held_slot: 0,
         }
     }
 }

@@ -33,7 +33,7 @@ pub async fn handle_java_connection(
         return Ok(());
     }
 
-    if handshake.next_state == 1 && !is_supported_login_protocol(handshake.protocol_version) {
+    if handshake.next_state == 1 {
         let _request = read_packet(&mut client).await?;
         send_status_response_direct(&mut client, handshake.protocol_version, &_config).await?;
         return Ok(());

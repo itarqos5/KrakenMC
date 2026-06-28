@@ -99,33 +99,26 @@ pub(crate) async fn send_status_response_direct(
     config: &ServerConfig,
 ) -> std::io::Result<()> {
     let motd = json_escape(&config.motd);
-    let is_supported = is_supported_login_protocol(protocol_version);
+    let _is_supported = is_supported_login_protocol(protocol_version);
 
-    let name = match protocol_version {
-        766 => "1.20.5".to_string(),
-        767 => "1.21".to_string(),
-        774 => "1.21.11".to_string(),
-        775 => "26.1".to_string(),
-        776 => "1.21.11".to_string(),
-        _ => {
-            let mc_ver = MinecraftVersion::from_protocol(protocol_version as u32);
-            if mc_ver == MinecraftVersion::Unknown {
-                "1.21.11".to_string()
-            } else {
-                format!("{}", mc_ver)
-            }
-        }
-    };
+    let target_protocol = 774;
+    let target_name = "Kraken 1.21.11";
 
-    let (ver_name, advertised_protocol) = if is_supported {
-        (name, protocol_version)
+    let matches_version = protocol_version == 774 || protocol_version == 776;
+
+    let (ver_name, advertised_protocol, sample_json) = if matches_version {
+        (target_name.to_string(), protocol_version, "[]".to_string())
     } else {
-        (format!("Kraken {}", name), 775)
+        (
+            target_name.to_string(),
+            target_protocol,
+            r#"[{"name":"Incompatible version!","id":"00000000-0000-0000-0000-000000000000"}]"#.to_string(),
+        )
     };
 
     let status_json = format!(
-        r#"{{"version":{{"name":"{}","protocol":{}}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":"{}"}}}}"#,
-        ver_name, advertised_protocol, config.max_players, motd
+        r#"{{"version":{{"name":"{}","protocol":{}}},"players":{{"max":{},"online":0,"sample":{}}},"description":{{"text":"{}"}}}}"#,
+        ver_name, advertised_protocol, config.max_players, sample_json, motd
     );
 
     let mut payload = Vec::new();

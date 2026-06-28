@@ -4,10 +4,10 @@ use std::sync::Arc;
 use pumpkin_protocol::java::client::config::{CFinishConfig, CKnownPacks, CRegistryData, RegistryEntry, CUpdateTags};
 use pumpkin_protocol::java::client::login::CLoginSuccess;
 use pumpkin_protocol::java::client::play::{
-    CAcknowledgeBlockChange, CBlockUpdate, CCenterChunk, CGameEvent, CKeepAlive,
-    CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition, CPlayerSpawnPosition,
-    CSystemChatMessage, Player, PlayerInfoFlags,
-    GameEvent, PlayerAction, CChunkBatchStart, CChunkBatchEnd,
+    CAcknowledgeBlockChange, CBlockUpdate, CCenterChunk, CChunkBatchEnd, CChunkBatchStart,
+    CGameEvent, CKeepAlive, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition,
+    CSystemChatMessage, CEntityStatus, CPlayerSpawnPosition, Player, PlayerInfoFlags,
+    GameEvent, PlayerAction, CCustomPayload
 };
 use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
 use pumpkin_protocol::java::server::login::SLoginAcknowledged;
@@ -20,7 +20,12 @@ use pumpkin_util::version::MinecraftVersion;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
+use tokio::sync::broadcast;
+use std::sync::OnceLock;
 use uuid::Uuid;
+
+use pumpkin_protocol::java::server::play::SChatMessage;
+use pumpkin_protocol::ServerPacket;
 
 use crate::config::ServerConfig;
 use crate::logger::{log_info, log_warn};
@@ -35,6 +40,14 @@ use crate::viakraken::utils::{
 };
 use crate::world::chunk_gen::encode_chunk_packet;
 use crate::world::player_store::{load_player, save_player, PlayerData};
+
+pub fn chat_channel() -> broadcast::Sender<String> {
+    static CHAT_CHANNEL: OnceLock<broadcast::Sender<String>> = OnceLock::new();
+    CHAT_CHANNEL.get_or_init(|| {
+        let (tx, _) = broadcast::channel(100);
+        tx
+    }).clone()
+}
 
 pub async fn run_backend_listener(
     listener: TcpListener,
@@ -244,8 +257,8 @@ async fn handle_play(
             "minecraft:the_end".to_string(),
         ],
         VarInt(config.max_players as i32),
-        VarInt(10),
-        VarInt(10),
+        VarInt(3),
+        VarInt(3),
         false,
         true,
         false,
@@ -321,6 +334,13 @@ async fn handle_play(
         write_framed_payload(stream, payload.as_slice()).await?;
     }
 
+    // --- Start waiting for level chunks ---
+    {
+        let waiting = CGameEvent::new(GameEvent::StartWaitingChunks, 0.0);
+        let payload = encode_java_packet(&waiting, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+    }
+
     // --- Center Chunk ---
     let chunk_x = (player.x as i32) >> 4;
     let chunk_z = (player.z as i32) >> 4;
@@ -330,14 +350,14 @@ async fn handle_play(
         write_framed_payload(stream, payload.as_slice()).await?;
     }
 
-    // --- Send nearby chunks (3x3 grid around player) with chunk batches ---
+    // --- Send nearby chunks (7x7 grid around player) with chunk batches ---
     let batch_start = CChunkBatchStart;
     let start_payload = encode_java_packet(&batch_start, version)?;
     write_framed_payload(stream, start_payload.as_slice()).await?;
 
     let mut chunk_count = 0u16;
-    for dz in -2i32..=2 {
-        for dx in -2i32..=2 {
+    for dz in -3i32..=3 {
+        for dx in -3i32..=3 {
             let cx = chunk_x + dx;
             let cz = chunk_z + dz;
             let chunk_packet_bytes = encode_chunk_packet(cx, cz, protocol_version);
@@ -349,6 +369,21 @@ async fn handle_play(
     let batch_end = CChunkBatchEnd::new(chunk_count);
     let end_payload = encode_java_packet(&batch_end, version)?;
     write_framed_payload(stream, end_payload.as_slice()).await?;
+
+    // --- Enable F3+F4 Gamemode Switcher (OP level 4) ---
+    {
+        let op_status = CEntityStatus::new(1, 28);
+        let payload = encode_java_packet(&op_status, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+    }
+
+    // --- Server Branding ---
+    {
+        let brand_data = b"\x06Kraken";
+        let brand_pkt = CCustomPayload::new("minecraft:brand", brand_data);
+        let payload = encode_java_packet(&brand_pkt, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+    }
 
     log_info!(
         "Login flow completed for {} (protocol={}, max_players={}, pos=({:.1},{:.1},{:.1}))",
@@ -363,9 +398,17 @@ async fn handle_play(
     let mut keep_alive_id = 0i64;
     let mut buf = vec![0u8; 65536];
     let mut pending_bytes = Vec::new();
+    let mut chat_rx = chat_channel().subscribe();
 
     'play: loop {
         tokio::select! {
+            Ok(msg) = chat_rx.recv() => {
+                let text_comp = TextComponent::text(msg);
+                let pkt = CSystemChatMessage::new(&text_comp, false);
+                if let Ok(payload) = encode_java_packet(&pkt, version) {
+                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                }
+            }
             _ = interval.tick() => {
                 keep_alive_id = keep_alive_id.wrapping_add(1);
                 let ka = CKeepAlive::new(keep_alive_id);
@@ -458,8 +501,8 @@ async fn handle_play_packet(
             if status == 0 || status == 2 {
                 // Unpack BlockPos: x=26bit signed, y=12bit signed, z=26bit signed
                 let x = (packed >> 38) as i32;
-                let y = ((packed << 26) >> 52) as i32;
-                let z = ((packed << 38) >> 38) as i32;
+                let y = ((packed << 52) >> 52) as i32;
+                let z = ((packed << 26) >> 38) as i32;
                 let block_pos = BlockPos(Vector3 { x, y, z });
 
                 // Acknowledge block change
@@ -487,8 +530,8 @@ async fn handle_play_packet(
 
             // Unpack target block pos
             let x = (packed >> 38) as i32;
-            let y = ((packed << 26) >> 52) as i32;
-            let z = ((packed << 38) >> 38) as i32;
+            let y = ((packed << 52) >> 52) as i32;
+            let z = ((packed << 26) >> 38) as i32;
 
             // Compute adjacent block pos based on face
             let (nx, ny, nz) = match face {
@@ -502,15 +545,15 @@ async fn handle_play_packet(
             };
             let place_pos = BlockPos(Vector3 { x: nx, y: ny, z: nz });
 
-            // Acknowledge
-            let ack = CAcknowledgeBlockChange::new(VarInt(sequence));
-            let ack_payload = encode_java_packet(&ack, version)?;
-            write_framed_payload(stream, ack_payload.as_slice()).await?;
-
-            // Place stone (state ID 1) at adjacent position
-            let update = CBlockUpdate::new(place_pos, VarInt(1));
-            let update_payload = encode_java_packet(&update, version)?;
-            write_framed_payload(stream, update_payload.as_slice()).await?;
+            // Acknowledge the placement
+            if sequence > 0 {
+                let ack = CAcknowledgeBlockChange::new(VarInt(sequence));
+                let ack_payload = encode_java_packet(&ack, version)?;
+                write_framed_payload(stream, ack_payload.as_slice()).await?;
+            }
+            
+            // Note: We no longer force the block to Stone! The client will keep the block it placed locally.
+            // A full implementation would track the block state in world chunks.
         }
     } else if pid == sv_change_gm && sv_change_gm >= 0 {
         // SChangeGameMode: gamemode (VarInt)
@@ -530,21 +573,53 @@ async fn handle_play_packet(
         }
     } else if pid == sv_pos_rot {
         // SPlayerPositionRotation: x(f64), y(f64), z(f64), yaw(f32), pitch(f32), collision(u8)
-        if payload.len() >= 25 {
+        if payload.len() >= 33 {
             player.x = f64::from_be_bytes(payload[0..8].try_into().unwrap_or_default());
             player.y = f64::from_be_bytes(payload[8..16].try_into().unwrap_or_default());
             player.z = f64::from_be_bytes(payload[16..24].try_into().unwrap_or_default());
             player.yaw = f32::from_be_bytes(payload[24..28].try_into().unwrap_or_default());
-            if payload.len() >= 29 {
-                player.pitch = f32::from_be_bytes(payload[28..32].try_into().unwrap_or_default());
-            }
+            player.pitch = f32::from_be_bytes(payload[28..32].try_into().unwrap_or_default());
+            
+            let on_ground = payload[32] != 0;
+            process_fall_damage(stream, version, player, on_ground).await?;
         }
     } else if pid == sv_pos {
         // SPlayerPosition: x, y, z, collision
-        if payload.len() >= 24 {
+        if payload.len() >= 25 {
             player.x = f64::from_be_bytes(payload[0..8].try_into().unwrap_or_default());
             player.y = f64::from_be_bytes(payload[8..16].try_into().unwrap_or_default());
             player.z = f64::from_be_bytes(payload[16..24].try_into().unwrap_or_default());
+            
+            let on_ground = payload[24] != 0;
+            process_fall_damage(stream, version, player, on_ground).await?;
+        }
+    } else if pid == pumpkin_data::packet::serverbound::PLAY_MOVE_PLAYER_ROT.to_id(version) {
+        // SPlayerRotation: yaw, pitch, collision
+        if payload.len() >= 8 {
+            player.yaw = f32::from_be_bytes(payload[0..4].try_into().unwrap_or_default());
+            player.pitch = f32::from_be_bytes(payload[4..8].try_into().unwrap_or_default());
+        }
+    }
+
+    if player.y < -64.0 {
+        // Reset player if they fall into the void (since chunk generation is limited to spawn area)
+        player.x = 0.0;
+        player.y = 70.0;
+        player.z = 0.0;
+        
+        let pos_pkt = CPlayerPosition::new(
+            VarInt(1),
+            Vector3 { x: player.x, y: player.y, z: player.z },
+            Vector3 { x: 0.0, y: 0.0, z: 0.0 },
+            player.yaw,
+            player.pitch,
+            vec![],
+        );
+        let payload = encode_java_packet(&pos_pkt, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+    } else if pid == pumpkin_data::packet::serverbound::PLAY_CHAT.to_id(version) {
+        if let Ok(msg) = SChatMessage::read(&mut std::io::Cursor::new(payload), &version) {
+            let _ = chat_channel().send(format!("<{}> {}", username, msg.message));
         }
     }
     // All other packets (keep-alive echo, client info, etc.) are silently discarded.
@@ -606,6 +681,29 @@ async fn handle_command(
         }
         _ => {
             send_system_message(stream, version, &format!("Unknown command: /{}", cmd)).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn process_fall_damage(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    player: &mut PlayerData,
+    on_ground: bool,
+) -> std::io::Result<()> {
+    if on_ground {
+        let fall_dist = player.highest_y - player.y;
+        if fall_dist > 3.0 && player.gamemode == 0 { // Survival mode only
+            // Send damage animation (entity status 2)
+            let status = CEntityStatus::new(1, 2);
+            let payload = encode_java_packet(&status, version)?;
+            write_framed_payload(stream, payload.as_slice()).await?;
+        }
+        player.highest_y = player.y;
+    } else {
+        if player.y > player.highest_y {
+            player.highest_y = player.y;
         }
     }
     Ok(())

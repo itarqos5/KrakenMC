@@ -11,8 +11,3 @@ mkdir tests
 
 echo Copying executable...
 copy target\release\kraken.exe tests\ >nul
-
-echo Starting server...
-cd tests
-kraken.exe
-cd ..
