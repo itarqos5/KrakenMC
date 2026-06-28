@@ -13,11 +13,13 @@ mod utils;
 
 pub struct ViaKrakenPlugin {
     pub config: Arc<ServerConfig>,
+    pub db: Arc<sled::Db>,
 }
 
 impl Plugin for ViaKrakenPlugin {
     fn build(&self, _app: &mut bevy_app::App) {
         let runtime_config = self.config.clone();
+        let runtime_db = self.db.clone();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -30,6 +32,7 @@ impl Plugin for ViaKrakenPlugin {
             runtime.block_on(async move {
                 let vk = ViaKraken {
                     config: runtime_config,
+                    db: runtime_db,
                 };
                 vk.start().await;
             });
@@ -39,6 +42,7 @@ impl Plugin for ViaKrakenPlugin {
 
 pub struct ViaKraken {
     pub config: Arc<ServerConfig>,
+    pub db: Arc<sled::Db>,
 }
 
 impl ViaKraken {
@@ -73,9 +77,10 @@ impl ViaKraken {
         );
 
         let backend_config = self.config.clone();
+        let backend_db = self.db.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                java::run_backend_listener(backend_listener, backend_config, backend_port).await
+                java::run_backend_listener(backend_listener, backend_config, backend_port, backend_db).await
             {
                 log_error!("Backend listener stopped: {}", e);
             }
