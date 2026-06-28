@@ -27,6 +27,7 @@ rustc_version_runtime = "0.3"
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "95df70c448adb01a9628f94aa732fd86a277bf62", package = "pumpkin-protocol" }
 pumpkin-util = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "95df70c448adb01a9628f94aa732fd86a277bf62", package = "pumpkin-util" }
+pumpkin-data = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "95df70c448adb01a9628f94aa732fd86a277bf62", package = "pumpkin-data" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }

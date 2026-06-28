@@ -1,11 +1,12 @@
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
-use pumpkin_protocol::java::client::config::{CFinishConfig, CKnownPacks};
+use pumpkin_protocol::java::client::config::{CFinishConfig, CKnownPacks, CRegistryData, RegistryEntry, CUpdateTags};
 use pumpkin_protocol::java::client::login::CLoginSuccess;
 use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
 use pumpkin_protocol::java::server::login::SLoginAcknowledged;
 use pumpkin_protocol::{KnownPack, Property};
+use pumpkin_util::version::MinecraftVersion;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
@@ -16,6 +17,7 @@ use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::java::protocol::{parse_handshake, parse_login_start};
 use crate::viakraken::java::support::{
     minecraft_version_from_protocol, packet_id_for_version, strict_error_handling,
+    is_supported_login_protocol,
 };
 use crate::viakraken::utils::{
     json_escape, packet_id, read_packet, read_varint_from_slice, write_framed_payload,
@@ -139,6 +141,57 @@ async fn handle_login(
     let known_packs_payload = encode_java_packet(&known_packs_packet, version)?;
     write_framed_payload(stream, known_packs_payload.as_slice()).await?;
 
+    // Send registry data
+    let registry = pumpkin_data::registry::Registry::get_synced(version);
+    for reg in registry {
+        let entries: Vec<RegistryEntry> = reg
+            .registry_entries
+            .iter()
+            .map(|r| RegistryEntry::new(r.entry_id.clone(), r.data.clone()))
+            .collect();
+        let packet = CRegistryData::new(&reg.registry_id, &entries);
+        let payload = encode_java_packet(&packet, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+    }
+
+    // Send tags
+    let mut tags = vec![
+        pumpkin_data::tag::RegistryKey::Block,
+        pumpkin_data::tag::RegistryKey::Fluid,
+        pumpkin_data::tag::RegistryKey::Enchantment,
+        pumpkin_data::tag::RegistryKey::WorldgenBiome,
+        pumpkin_data::tag::RegistryKey::Item,
+        pumpkin_data::tag::RegistryKey::EntityType,
+        pumpkin_data::tag::RegistryKey::Dialog,
+    ];
+
+    if version.protocol_version() >= MinecraftVersion::V_1_21_11.protocol_version() {
+        if let Some(map) = pumpkin_data::tag::get_registry_key_tags(version, pumpkin_data::tag::RegistryKey::Timeline) {
+            if !map.is_empty() {
+                tags.push(pumpkin_data::tag::RegistryKey::Timeline);
+            }
+        }
+    }
+    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(version, pumpkin_data::tag::RegistryKey::DimensionType) {
+        if !map.is_empty() {
+            tags.push(pumpkin_data::tag::RegistryKey::DimensionType);
+        }
+    }
+    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(version, pumpkin_data::tag::RegistryKey::DamageType) {
+        if !map.is_empty() {
+            tags.push(pumpkin_data::tag::RegistryKey::DamageType);
+        }
+    }
+    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(version, pumpkin_data::tag::RegistryKey::BannerPattern) {
+        if !map.is_empty() {
+            tags.push(pumpkin_data::tag::RegistryKey::BannerPattern);
+        }
+    }
+
+    let tags_packet = CUpdateTags::new(&tags);
+    let tags_payload = encode_java_packet(&tags_packet, version)?;
+    write_framed_payload(stream, tags_payload.as_slice()).await?;
+
     let finish_config_packet = CFinishConfig;
     let finish_config_payload = encode_java_packet(&finish_config_packet, version)?;
     write_framed_payload(stream, finish_config_payload.as_slice()).await?;
@@ -146,19 +199,13 @@ async fn handle_login(
     let mut entered_play = false;
     let config_finish_id =
         packet_id_for_version::<SAcknowledgeFinishConfig>(version, "config-finish")?;
-    if let Ok(Ok(config_finish_packet)) =
-        timeout(Duration::from_secs(15), read_packet(stream)).await
-    {
-        let finish_id = packet_id(&config_finish_packet)?;
+    while let Ok(Ok(config_packet)) = timeout(Duration::from_secs(15), read_packet(stream)).await {
+        let finish_id = packet_id(&config_packet)?;
         if finish_id == config_finish_id {
             entered_play = true;
+            break;
         } else {
-            log_warn!(
-                "Unexpected config packet for {}: id={} expected={}",
-                username,
-                finish_id,
-                config_finish_id
-            );
+            log_info!("Received client config packet: id={} for {}", finish_id, username);
         }
     }
 

@@ -28,7 +28,7 @@ pub(super) fn packet_id_for_version<P: MultiVersionJavaPacket>(
 }
 
 pub(super) fn is_supported_login_protocol(protocol: i32) -> bool {
-    matches!(protocol, 766 | 767 | 774)
+    matches!(protocol, 766 | 767 | 774 | 775)
 }
 
 pub(super) fn minecraft_version_from_protocol(protocol: i32) -> std::io::Result<MinecraftVersion> {
