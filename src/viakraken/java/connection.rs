@@ -10,6 +10,7 @@ use crate::viakraken::java::packets::send_login_disconnect_json;
 use crate::viakraken::java::protocol::{parse_handshake, parse_login_start_username};
 use crate::viakraken::java::support::{
     infer_bridge_failure_direction, is_decoder_exception, is_supported_login_protocol,
+    minecraft_version_from_protocol,
 };
 use crate::viakraken::java::types::LoginStartInfo;
 use crate::viakraken::utils::{read_packet, write_framed_payload};
@@ -35,7 +36,8 @@ pub async fn handle_java_connection(
     if handshake.next_state == 2 && !is_supported_login_protocol(handshake.protocol_version) {
         send_login_disconnect_json(
             &mut client,
-            "Unsupported Java protocol. Supported: 766, 767, 774, 775.",
+            handshake.protocol_version,
+            "Unsupported Java protocol. Supported: 766, 767, 774.",
         )
         .await?;
         log_warn!(
@@ -52,6 +54,7 @@ pub async fn handle_java_connection(
             if handshake.next_state == 2 {
                 let _ = send_login_disconnect_json(
                     &mut client,
+                    handshake.protocol_version,
                     "Backend unavailable. Please retry in a few seconds.",
                 )
                 .await;
@@ -82,10 +85,12 @@ pub async fn handle_java_connection(
         handshake.protocol_version
     );
 
+    let version = minecraft_version_from_protocol(handshake.protocol_version)?;
     let player = match relay_login_handoff(
         &mut client,
         &mut backend,
         handshake.protocol_version,
+        version,
         &login_start.username,
     )
     .await
@@ -95,6 +100,7 @@ pub async fn handle_java_connection(
         Err(e) if is_decoder_exception(&e) => {
             let _ = send_login_disconnect_json(
                 &mut client,
+                handshake.protocol_version,
                 "DecoderException: malformed login packet",
             )
             .await;

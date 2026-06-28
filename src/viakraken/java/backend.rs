@@ -1,26 +1,28 @@
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
+use pumpkin_protocol::java::client::config::{CFinishConfig, CKnownPacks};
+use pumpkin_protocol::java::client::login::CLoginSuccess;
+use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
+use pumpkin_protocol::java::server::login::SLoginAcknowledged;
+use pumpkin_protocol::{KnownPack, Property};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 use crate::config::ServerConfig;
 use crate::logger::{log_info, log_warn};
-use crate::viakraken::java::packets::{
-    build_finish_config_packet, build_known_packs_packet, build_login_success_packet,
-};
+use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::java::protocol::{parse_handshake, parse_login_start};
 use crate::viakraken::java::support::{
-    minecraft_version_from_protocol, strict_error_handling, LOGIN_ACKNOWLEDGED_ID,
-    CONFIG_FINISH_SERVERBOUND_ID,
+    minecraft_version_from_protocol, packet_id_for_version, strict_error_handling,
 };
 use crate::viakraken::utils::{
     json_escape, packet_id, read_packet, read_varint_from_slice, write_framed_payload,
     write_packet, write_string,
 };
 
-const NATIVE_PROTOCOL: i32 = 775;
+const NATIVE_PROTOCOL: i32 = 776;
 
 pub async fn run_backend_listener(
     listener: TcpListener,
@@ -80,7 +82,7 @@ async fn handle_status(
         protocol_version
     };
     let status_json = format!(
-        r#"{{"version":{{"name":"26.1","protocol":{}}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":"{}"}}}}"#,
+        r#"{{"version":{{"name":"1.21.1","protocol":{}}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":"{}"}}}}"#,
         advertised_protocol, config.max_players, motd
     );
 
@@ -106,55 +108,56 @@ async fn handle_login(
     config: &ServerConfig,
     protocol_version: i32,
 ) -> std::io::Result<()> {
-    let _version = minecraft_version_from_protocol(protocol_version)?;
+    let version = minecraft_version_from_protocol(protocol_version)?;
 
     let login_start_packet = read_packet(stream).await?;
     let (username, claimed_uuid) = parse_login_start(&login_start_packet)?;
     let profile_uuid = claimed_uuid.unwrap_or_else(Uuid::new_v4);
+    let properties: Vec<Property> = Vec::new();
 
-    let strict = strict_error_handling(protocol_version);
-    let core = crate::viakraken::java::types::LoginSuccessCore {
-        uuid: profile_uuid,
-        username: username.clone(),
-        properties: Vec::new(),
-    };
-    let login_success_payload = build_login_success_packet(&core, strict)?;
+    let strict_error_handling = strict_error_handling(protocol_version);
+    let login_success =
+        CLoginSuccess::new(&profile_uuid, &username, &properties, strict_error_handling);
+    let login_success_payload = encode_java_packet(&login_success, version)?;
     write_framed_payload(stream, login_success_payload.as_slice()).await?;
 
-    // Wait for LoginAcknowledge
+    let login_ack_id = packet_id_for_version::<SLoginAcknowledged>(version, "login-ack")?;
     if let Ok(Ok(login_ack_packet)) = timeout(Duration::from_secs(15), read_packet(stream)).await {
         let ack_id = packet_id(&login_ack_packet)?;
-        if ack_id != LOGIN_ACKNOWLEDGED_ID {
+        if ack_id != login_ack_id {
             log_warn!(
                 "Unexpected login packet after Login Success: id={} expected={} (user={})",
                 ack_id,
-                LOGIN_ACKNOWLEDGED_ID,
+                login_ack_id,
                 username
             );
         }
     }
 
-    // Send KnownPacks
-    let known_packs_payload = build_known_packs_packet();
+    let known_packs: [KnownPack<'static>; 0] = [];
+    let known_packs_packet = CKnownPacks::new(&known_packs);
+    let known_packs_payload = encode_java_packet(&known_packs_packet, version)?;
     write_framed_payload(stream, known_packs_payload.as_slice()).await?;
 
-    // Send FinishConfig
-    let finish_config_payload = build_finish_config_packet();
+    let finish_config_packet = CFinishConfig;
+    let finish_config_payload = encode_java_packet(&finish_config_packet, version)?;
     write_framed_payload(stream, finish_config_payload.as_slice()).await?;
 
     let mut entered_play = false;
+    let config_finish_id =
+        packet_id_for_version::<SAcknowledgeFinishConfig>(version, "config-finish")?;
     if let Ok(Ok(config_finish_packet)) =
         timeout(Duration::from_secs(15), read_packet(stream)).await
     {
         let finish_id = packet_id(&config_finish_packet)?;
-        if finish_id == CONFIG_FINISH_SERVERBOUND_ID {
+        if finish_id == config_finish_id {
             entered_play = true;
         } else {
             log_warn!(
                 "Unexpected config packet for {}: id={} expected={}",
                 username,
                 finish_id,
-                CONFIG_FINISH_SERVERBOUND_ID
+                config_finish_id
             );
         }
     }

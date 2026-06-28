@@ -1,7 +1,12 @@
+use std::io::{Error, ErrorKind};
+
+use pumpkin_protocol::bedrock::{client::disconnect_player::CDisconnectPlayer, RAKNET_MAGIC};
+use pumpkin_protocol::{packet::Packet, BClientPacket};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-const RAKNET_MAGIC: &[u8; 16] = b"\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78";
+use crate::viakraken::utils::ByteBuffer;
+
 const BEDROCK_COMING_SOON: &str = "Bedrock Support Coming Soon";
 
 pub async fn is_probably_bedrock(stream: &mut TcpStream) -> std::io::Result<bool> {
@@ -22,40 +27,16 @@ pub async fn is_probably_bedrock(stream: &mut TcpStream) -> std::io::Result<bool
 }
 
 pub async fn handle_bedrock_disconnect(stream: &mut TcpStream) -> std::io::Result<()> {
-    let reason = BEDROCK_COMING_SOON;
-    let reason_bytes = reason.as_bytes();
-    // Packet ID 0x05 + VarInt reason(2) + bool hide_screen(0) + bool skip_message(0)
-    // + String: message + String: filtered_message(empty) + String: disconnect_message2(empty)
-    let mut payload = Vec::with_capacity(32 + reason_bytes.len());
-    // CDisconnectPlayer packet ID
-    payload.push(0x05);
-    // Reason enum: 0x02 = kick
-    write_unsigned_varint(&mut payload, 2);
-    // HideDisconnectionScreen: false
-    payload.push(0x00);
-    // SkipMessage: false
-    payload.push(0x00);
-    // Message: string (unsigned varint length prefix)
-    write_unsigned_varint(&mut payload, reason_bytes.len() as u32);
-    payload.extend_from_slice(reason_bytes);
-    // FilteredMessage: empty string
-    write_unsigned_varint(&mut payload, 0);
-    // DisconnectMessage2: empty string (newer versions)
-    write_unsigned_varint(&mut payload, 0);
+    let packet = CDisconnectPlayer::new(2, BEDROCK_COMING_SOON.to_owned());
 
-    stream.write_all(&payload).await?;
+    let mut response = ByteBuffer::new();
+    response.push(CDisconnectPlayer::PACKET_ID as u8);
+    packet
+        .write_packet(&mut response)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+
+    stream.write_all(response.as_slice()).await?;
     stream.flush().await?;
     let _ = stream.shutdown().await;
     Ok(())
-}
-
-fn write_unsigned_varint(buf: &mut Vec<u8>, mut value: u32) {
-    loop {
-        if value & !0x7F == 0 {
-            buf.push(value as u8);
-            break;
-        }
-        buf.push(((value & 0x7F) as u8) | 0x80);
-        value >>= 7;
-    }
 }
