@@ -132,7 +132,9 @@ pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32) ->
         if all_same {
             sections_buf.push(0); // bits per entry
             write_vi(&mut sections_buf, first as i32); // state id
-            write_vi(&mut sections_buf, 0); // data array length (no longs)
+            if version <= MinecraftVersion::V_1_21_4 {
+                write_vi(&mut sections_buf, 0); // data array length (no longs)
+            }
         } else {
             let bits: usize = 15;
             let values_per_i64 = 64 / bits; // 4
@@ -145,6 +147,9 @@ pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32) ->
                 longs[long_idx] |= (block as i64) << bit_idx;
             }
             sections_buf.push(bits as u8);
+            if version <= MinecraftVersion::V_1_21_4 {
+                write_vi(&mut sections_buf, longs.len() as i32);
+            }
             for packed in longs {
                 sections_buf.extend_from_slice(&packed.to_be_bytes());
             }
@@ -153,7 +158,9 @@ pub fn encode_chunk_packet(chunk_x: i32, chunk_z: i32, protocol_version: i32) ->
         // Biome palette - single value (plains)
         sections_buf.push(0); // bits per entry = 0 (single)
         write_vi(&mut sections_buf, PLAINS_BIOME as i32);
-        write_vi(&mut sections_buf, 0); // no data array
+        if version <= MinecraftVersion::V_1_21_4 {
+            write_vi(&mut sections_buf, 0); // no data array
+        }
     }
 
     // Write sections size as VarInt then the data
