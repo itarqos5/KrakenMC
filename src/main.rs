@@ -58,6 +58,7 @@ fn print_startup_diagnostics() {
 }
 
 fn main() {
+    let start_time = std::time::Instant::now();
     // 1. Force-enable Windows Command Prompt ANSI VT processing via native Kernel32 call
     let windows_vt_enabled = unsafe {
         #[cfg(windows)]
@@ -130,6 +131,9 @@ fn main() {
     app.add_plugins(viakraken::ViaKrakenPlugin { config: vk_config });
     app.add_plugins(systems::persistence::PersistencePlugin);
     app.add_plugins(world::WorldPlugin);
+
+    let startup_ms = start_time.elapsed().as_millis();
+    logger::log_info!("Done! Startup took {}ms", startup_ms);
 
     loop {
         app.update();
