@@ -3,9 +3,12 @@ use std::sync::Arc;
 
 use bevy_app::Plugin;
 use bevy_ecs::prelude::*;
-use noise::{NoiseFn, Perlin};
+use noise::Perlin;
 
 use crate::logger::{log_error, log_info, log_warn};
+
+pub mod chunk_gen;
+pub mod player_store;
 
 pub struct WorldPlugin;
 
@@ -102,6 +105,4 @@ fn try_remove_lock(path: &Path) -> bool {
     }
 }
 
-fn generate_chunks(world: Res<ServerWorld>) {
-    let _ = world.terrain.get([0.0, 0.0, 0.0]);
-}
+fn generate_chunks(_world: Res<ServerWorld>) {}

@@ -128,7 +128,7 @@ fn main() {
 
     app.insert_resource(WorldDb(db.clone()));
 
-    app.add_plugins(viakraken::ViaKrakenPlugin { config: vk_config });
+    app.add_plugins(viakraken::ViaKrakenPlugin { config: vk_config, db: db.clone() });
     app.add_plugins(systems::persistence::PersistencePlugin);
     app.add_plugins(world::WorldPlugin);
 
