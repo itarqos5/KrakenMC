@@ -7,7 +7,7 @@ use pumpkin_protocol::java::client::play::{
     CAcknowledgeBlockChange, CBlockUpdate, CCenterChunk, CGameEvent, CKeepAlive,
     CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition, CPlayerSpawnPosition,
     CSystemChatMessage, Player, PlayerInfoFlags,
-    GameEvent, PlayerAction,
+    GameEvent, PlayerAction, CChunkBatchStart, CChunkBatchEnd,
 };
 use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
 use pumpkin_protocol::java::server::login::SLoginAcknowledged;
@@ -330,15 +330,25 @@ async fn handle_play(
         write_framed_payload(stream, payload.as_slice()).await?;
     }
 
-    // --- Send nearby chunks (3x3 grid around player) ---
+    // --- Send nearby chunks (3x3 grid around player) with chunk batches ---
+    let batch_start = CChunkBatchStart;
+    let start_payload = encode_java_packet(&batch_start, version)?;
+    write_framed_payload(stream, start_payload.as_slice()).await?;
+
+    let mut chunk_count = 0u16;
     for dz in -2i32..=2 {
         for dx in -2i32..=2 {
             let cx = chunk_x + dx;
             let cz = chunk_z + dz;
             let chunk_packet_bytes = encode_chunk_packet(cx, cz, protocol_version);
             write_framed_payload(stream, &chunk_packet_bytes).await?;
+            chunk_count += 1;
         }
     }
+
+    let batch_end = CChunkBatchEnd::new(chunk_count);
+    let end_payload = encode_java_packet(&batch_end, version)?;
+    write_framed_payload(stream, end_payload.as_slice()).await?;
 
     log_info!(
         "Login flow completed for {} (protocol={}, max_players={}, pos=({:.1},{:.1},{:.1}))",
