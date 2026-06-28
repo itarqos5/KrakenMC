@@ -20,14 +20,13 @@ use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::java::protocol::{parse_handshake, parse_login_start};
 use crate::viakraken::java::support::{
     minecraft_version_from_protocol, packet_id_for_version, strict_error_handling,
-    is_supported_login_protocol,
+    send_status_response_direct,
 };
 use crate::viakraken::utils::{
-    json_escape, packet_id, read_packet, read_varint_from_slice, write_framed_payload,
-    write_packet, write_string,
+    packet_id, read_packet, read_varint_from_slice, write_framed_payload,
 };
 
-const NATIVE_PROTOCOL: i32 = 775;
+
 
 pub async fn run_backend_listener(
     listener: TcpListener,
@@ -80,51 +79,7 @@ async fn handle_status(
         ));
     }
 
-    let motd = json_escape(&config.motd);
-    let is_supported = is_supported_login_protocol(protocol_version) || protocol_version == NATIVE_PROTOCOL;
-
-    let name = match protocol_version {
-        766 => "1.20.5".to_string(),
-        767 => "1.21".to_string(),
-        774 => "1.21.11".to_string(),
-        775 => "26.1".to_string(),
-        776 => "1.21.11".to_string(),
-        _ => {
-            let mc_ver = MinecraftVersion::from_protocol(protocol_version as u32);
-            if mc_ver == MinecraftVersion::Unknown {
-                "1.21.11".to_string()
-            } else {
-                format!("{}", mc_ver)
-            }
-        }
-    };
-
-    let (ver_name, advertised_protocol) = if is_supported {
-        (name, protocol_version)
-    } else {
-        (format!("Kraken {}", name), NATIVE_PROTOCOL)
-    };
-
-    let status_json = format!(
-        r#"{{"version":{{"name":"{}","protocol":{}}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":"{}"}}}}"#,
-        ver_name, advertised_protocol, config.max_players, motd
-    );
-
-    let mut payload = Vec::new();
-    write_string(&mut payload, &status_json)?;
-    write_packet(stream, 0x00, &payload).await?;
-
-    if let Ok(Ok(ping_packet)) = timeout(Duration::from_secs(15), read_packet(stream)).await {
-        let mut ping_offset = 0usize;
-        let ping_id = read_varint_from_slice(&ping_packet, &mut ping_offset)?;
-        if ping_id == 0x01 && ping_offset + 8 <= ping_packet.len() {
-            let mut pong_payload = Vec::with_capacity(8);
-            pong_payload.extend_from_slice(&ping_packet[ping_offset..ping_offset + 8]);
-            write_packet(stream, 0x01, &pong_payload).await?;
-        }
-    }
-
-    Ok(())
+    send_status_response_direct(stream, protocol_version, config).await
 }
 
 async fn handle_login(
@@ -275,12 +230,26 @@ async fn handle_login(
         config.max_players
     );
 
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut keep_alive_id = 0i64;
+    let mut buf = [0u8; 1024];
+
     loop {
-        let mut buf = [0u8; 1024];
-        match stream.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
+        tokio::select! {
+            _ = interval.tick() => {
+                keep_alive_id = keep_alive_id.wrapping_add(1);
+                let keep_alive = pumpkin_protocol::java::client::play::CKeepAlive::new(keep_alive_id);
+                if let Ok(payload) = encode_java_packet(&keep_alive, version) {
+                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                }
+            }
+            res = stream.read(&mut buf) => {
+                match res {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
         }
     }
 

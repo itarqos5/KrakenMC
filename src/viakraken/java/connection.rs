@@ -10,7 +10,7 @@ use crate::viakraken::java::packets::send_login_disconnect_json;
 use crate::viakraken::java::protocol::{parse_handshake, parse_login_start_username};
 use crate::viakraken::java::support::{
     infer_bridge_failure_direction, is_decoder_exception, is_supported_login_protocol,
-    minecraft_version_from_protocol,
+    minecraft_version_from_protocol, send_status_response_direct,
 };
 use crate::viakraken::java::types::LoginStartInfo;
 use crate::viakraken::utils::{read_packet, write_framed_payload};
@@ -30,6 +30,12 @@ pub async fn handle_java_connection(
             peer_addr,
             handshake.next_state
         );
+        return Ok(());
+    }
+
+    if handshake.next_state == 1 && !is_supported_login_protocol(handshake.protocol_version) {
+        let _request = read_packet(&mut client).await?;
+        send_status_response_direct(&mut client, handshake.protocol_version, &_config).await?;
         return Ok(());
     }
 
