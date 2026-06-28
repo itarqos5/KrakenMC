@@ -114,7 +114,7 @@ fn main() {
     );
 
     logger::log_info!(
-        "Starting Kraken via Azalea infrastructure on {}:{}",
+        "Starting Kraken on {}:{}",
         server_config.server_ip,
         server_config.server_port
     );

@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use azalea_world::ChunkStorage;
 use bevy_app::Plugin;
 use bevy_ecs::prelude::*;
 use noise::{NoiseFn, Perlin};
@@ -12,14 +11,12 @@ pub struct WorldPlugin;
 
 #[derive(Resource)]
 pub struct ServerWorld {
-    pub storage: ChunkStorage,
     pub terrain: Perlin,
 }
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut bevy_app::App) {
         app.insert_resource(ServerWorld {
-            storage: ChunkStorage::default(),
             terrain: Perlin::new(42),
         });
         app.add_systems(bevy_app::Update, generate_chunks);
