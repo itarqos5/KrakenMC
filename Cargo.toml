@@ -33,8 +33,9 @@ pumpkin-util = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "95df70c44
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 [profile.release]
-lto = true
-codegen-units = 1
 opt-level = 3
 panic = "abort"
 strip = true # Further reduces binary size by removing debug symbols
+
+[profile.release.package.pumpkin-world]
+opt-level = 0
