@@ -83,9 +83,32 @@ async fn handle_status(
     } else {
         protocol_version
     };
+
+    let is_supported = is_supported_login_protocol(protocol_version) || protocol_version == NATIVE_PROTOCOL;
+    let name = match protocol_version {
+        766 => "1.20.5".to_string(),
+        767 => "1.21".to_string(),
+        774 => "1.21.11".to_string(),
+        775 => "26.1".to_string(),
+        776 => "1.21.11".to_string(),
+        _ => {
+            let mc_ver = MinecraftVersion::from_protocol(protocol_version as u32);
+            if mc_ver == MinecraftVersion::Unknown {
+                "1.21.11".to_string()
+            } else {
+                format!("{}", mc_ver)
+            }
+        }
+    };
+    let ver_name = if is_supported {
+        name
+    } else {
+        format!("Kraken {}", name)
+    };
+
     let status_json = format!(
-        r#"{{"version":{{"name":"1.21.1","protocol":{}}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":"{}"}}}}"#,
-        advertised_protocol, config.max_players, motd
+        r#"{{"version":{{"name":"{}","protocol":{}}},"players":{{"max":{},"online":0,"sample":[]}},"description":{{"text":"{}"}}}}"#,
+        ver_name, advertised_protocol, config.max_players, motd
     );
 
     let mut payload = Vec::new();
