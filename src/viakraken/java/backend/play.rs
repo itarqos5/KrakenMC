@@ -8,7 +8,7 @@ use pumpkin_protocol::java::client::play::{
     CCenterChunk, CChunkBatchEnd, CChunkBatchStart, CCommands, CEntityStatus, CGameEvent,
     CKeepAlive, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition, CPlayerSpawnPosition,
     CRemoveEntities, CRemovePlayerInfo, CSpawnEntity, CTeleportEntity, GameEvent, Player,
-    PlayerAction, PlayerInfoFlags, ProtoNode, ProtoNodeType, CCustomPayload,
+    PlayerAction, PlayerInfoFlags, ProtoNode, ProtoNodeType, CCustomPayload, CHeadRot,
 };
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::PositionFlag;
@@ -321,7 +321,7 @@ pub async fn handle_play(
     write_framed_payload(stream, end_payload.as_slice()).await?;
 
     {
-        let op_status = CEntityStatus::new(1, 28);
+        let op_status = CEntityStatus::new(my_entity_id, 28);
         let payload = encode_java_packet(&op_status, version)?;
         write_framed_payload(stream, payload.as_slice()).await?;
     }
@@ -406,6 +406,11 @@ pub async fn handle_play(
                                 true,
                             );
                             if let Ok(payload) = encode_java_packet(&tp_pkt, version) {
+                                let _ = write_framed_payload(stream, payload.as_slice()).await;
+                            }
+                            let head_yaw = (yaw * 256.0 / 360.0).rem_euclid(256.0) as u8;
+                            let head_rot = CHeadRot::new(VarInt(entity_id), head_yaw);
+                            if let Ok(payload) = encode_java_packet(&head_rot, version) {
                                 let _ = write_framed_payload(stream, payload.as_slice()).await;
                             }
                         }

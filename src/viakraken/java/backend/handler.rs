@@ -140,12 +140,25 @@ pub async fn handle_play_packet(
             let x = (pos_val >> 38) as i32;
             let y = ((pos_val << 52) >> 52) as i32;
             let z = ((pos_val << 26) >> 38) as i32;
-            
-            if status == 0 || status == 2 {
+            let mut seq_o = o + 8 + 1; // skip pos (8 bytes) and face (1 byte)
+            let sequence = if seq_o < payload.len() {
+                read_varint_from_slice(payload, &mut seq_o).unwrap_or(0)
+            } else {
+                0
+            };
+
+            if status == 2 || (status == 0 && player.gamemode == 1) {
                 save_block_change(db, x, y, z, 0);
                 let block_update = CBlockUpdate::new(BlockPos(Vector3 { x, y, z }), VarInt(0));
                 if let Ok(block_update_payload) = encode_java_packet(&block_update, version) {
                     let _ = block_channel().send(Bytes::from(block_update_payload.as_slice().to_vec()));
+                }
+            }
+
+            if sequence > 0 {
+                let ack = CAcknowledgeBlockChange::new(VarInt(sequence));
+                if let Ok(ack_payload) = encode_java_packet(&ack, version) {
+                    let _ = write_framed_payload(stream, ack_payload.as_slice()).await;
                 }
             }
         }
