@@ -50,11 +50,13 @@ fn print_startup_diagnostics() {
         version.major, version.minor, version.patch
     );
 
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let total_mb = sys.total_memory() / 1024;
-    let used_mb = sys.used_memory() / 1024;
-    logger::log_info!("Memory: {} MB total / {} MB used", total_mb, used_mb);
+    std::thread::spawn(|| {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let total_mb = sys.total_memory() / 1024;
+        let used_mb = sys.used_memory() / 1024;
+        logger::log_info!("Memory: {} MB total / {} MB used", total_mb, used_mb);
+    });
 }
 
 fn main() {
