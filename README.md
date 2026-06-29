@@ -1,41 +1,32 @@
 <div align="center">
   <h1>🦑 Kraken Minecraft Server</h1>
-  <p><strong>High-performance Minecraft Java Edition proxy/server backend built in Rust with Bevy ECS.</strong></p>
+  <p><strong>Ultra-fast, sub-10ms startup Minecraft Java Edition proxy/server backend built in Rust with Bevy ECS and Pumpkin Protocol.</strong></p>
 </div>
 
 ---
 
 ## Overview
 
-Kraken is a Rust-based Minecraft server engine designed for high-throughput Java Edition protocol handling. It acts as a protocol-aware bridge (via the ViaKraken plugin) and includes a modular ECS-driven backend built on Bevy.
+Kraken is a high-performance Rust-based Minecraft server engine designed for low latency and high throughput. It features an ultra-fast asynchronous boot pipeline (starting in ~10ms), a protocol-aware proxy bridge (via the ViaKraken plugin), and a modular Bevy ECS backend utilizing **Pumpkin Protocol** primitives.
 
 ## ✨ Features
 
-- 🦀 **Core:** Rust Nightly with `portable_simd` support for maximum throughput.
-- ⚙️ **Network Engine:** Native Minecraft Java protocol implementation via **[Azalea](https://github.com/mat-1/azalea)** primitives, supporting protocols **774 (1.21.11)** and **775 (26.1)**.
-- 🧩 **Architecture:** Driven by **Bevy ECS** for modular systems and concurrent game loops.
-- 💾 **Persistence:** Embedded **Sled** key-value store with **Postcard + Flate2 (Gzip)** compression for player states.
-- 🌉 **ViaKraken Bridge:** Custom Bevy plugin intercepting handshakes and login packets for seamless protocol mapping.
+- ⚡ **Ultra-Fast Startup:** Asynchronous hardware diagnostic polling allows the server to fully initialize and bind to network ports in under **10ms**.
+- 🦀 **Core:** Built on Rust with optimized memory management and concurrent task execution.
+- ⚙️ **Network Engine:** Native Minecraft Java protocol implementation powered by **[Pumpkin Protocol](https://github.com/Pumpkin-MC/Pumpkin)** & `pumpkin-data`, supporting multi-version client connections (up to **1.21.11 / 26.1**).
+- 🧩 **Architecture:** Driven by **Bevy ECS** with a cleanly modularized backend (`src/viakraken/java/backend/`) separated into dedicated state management, packet handlers, and session loops.
+- ⚔️ **Combat & PvP:** Real-time entity interactions including 1-heart melee punch damage, realistic fall damage mechanics, hurt animations (`CEntityStatus`), and broadcasted sound effects (`EntityPlayerHurt`).
+- 🔄 **Player Lifecycle:** Instant respawns, persistent inventory & health tracking, real-time multiplayer tablist synchronization, and interactive `/gamemode` autocompletion.
+- 💾 **Persistence:** Embedded **Sled** key-value database tracking player positions, inventory slots, and block modifications.
 
 ## 🚀 Getting Started
-
-### Prerequisites
-
-Kraken requires the **Rust Nightly** toolchain due to `portable_simd` usage in dependencies:
-
-```bash
-rustup toolchain install nightly
-rustup override set nightly
-```
 
 ### First Launch — EULA Gate
 
 Before any network listeners or game loops start, Kraken validates the EULA:
 
 - If `eula.txt` does **not** exist, the server creates it with `eula=false`, generates a default `server.properties`, logs an alert, and **halts immediately**.
-- If `eula.txt` exists but contains `eula=false`, the server logs an alert and halts.
-
-The engine **will not bind to port 25565** or initialize internal systems until `eula=true` is set. Edit `eula.txt` to accept the Mojang EULA before restarting.
+- The engine **will not bind to port 25565** or initialize internal systems until `eula=true` is set. Edit `eula.txt` to accept the Mojang EULA before starting.
 
 ### Installation & Running
 
@@ -50,32 +41,17 @@ The engine **will not bind to port 25565** or initialize internal systems until 
    cargo run --release
    ```
 
-## 🖥️ Platform Notes
-
-### Windows ANSI Console Colors
-
-On Windows, Kraken forces **native ANSI escape-code parsing** via a Kernel32 `SetConsoleMode(handle, ENABLE_VIRTUAL_TERMINAL_PROCESSING)` call. This prevents broken text tokens in legacy `cmd.exe` windows.
-
 ## 🏗️ Technical Architecture
 
-### Protocol 26.1 (775) — LoginSuccess Trailing Boolean
+### Modular Backend Structure (`src/viakraken/java/backend/`)
+To prevent monolithic file bloat, the Java backend is divided into specialized modules:
+- `mod.rs`: Manages TCP listener loops, status ping responses, and the initial login handshake state machine.
+- `state.rs`: Thread-safe global registries (`HashMap<Uuid, OnlinePlayer>`) and tokio broadcast channels (`PlayerEvent`, chat, and block updates).
+- `handler.rs`: Decodes incoming `ServerPacket` payloads (interact/attack, digging, block placement, chat commands) and processes combat physics.
+- `play.rs`: Handles the active session loop, entity spawning/despawning, tablist updates, keep-alives, and chunk broadcasting.
 
-Minecraft 26.1 appends a trailing 1-byte Boolean flag after the player UUID/Username payload in `ClientboundLoginFinishedPacket` (ID `0x02`). Kraken's decoder **explicitly consumes** this boolean under Protocol 775, emptying the buffer and eliminating the `found N bytes extra` DecoderException.
-
-### Persistence Lifecycle
-
-Kraken uses a **Dirty Component System** for database operations:
-- **Tracker:** Attaches a `Dirty` component to entities when `PlayerState` changes.
-- **Flusher:** Runs every 100 ticks, serializing dirty entities to Sled with Gzip compression and removing the marker.
-
-### Startup Diagnostics
-
-Kraken prints Paper-style diagnostic lines on boot:
-
-- **Host OS:** OS family and architecture (e.g., `windows (x86_64)`).
-- **Runtime:** Rust compiler version.
-- **Memory:** Total system memory and process heap usage in MB.
-- **Library Mapping:** Explicit loading sequence (`ViaKraken bridge`, `PersistencePlugin`, `WorldPlugin`, etc.).
+### Startup Latency Optimization
+By moving synchronous `sysinfo` hardware queries (OS memory and CPU enumeration) out of the critical bootstrap path and into a detached asynchronous thread, Kraken bypasses OS blocking calls during boot, consistently achieving start times around **10ms**.
 
 ## 📁 Generated Files
 
