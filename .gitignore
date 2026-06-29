@@ -2,3 +2,9 @@ target/*
 tests/*
 tests/
 *.exe
+world_data/
+world/
+world_nether/
+world_the_end/
+eula.txt
+server.properties
