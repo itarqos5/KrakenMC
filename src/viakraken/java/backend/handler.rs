@@ -127,6 +127,8 @@ pub async fn handle_play_packet(
                             x: vx,
                             y: vy,
                             z: vz,
+                            attacker_x: Some(player.x),
+                            attacker_z: Some(player.z),
                         });
                     }
                 }
@@ -153,6 +155,38 @@ pub async fn handle_play_packet(
                 if let Ok(block_update_payload) = encode_java_packet(&block_update, version) {
                     let _ = block_channel().send(Bytes::from(block_update_payload.as_slice().to_vec()));
                 }
+
+                use super::state::{ItemEvent, NEXT_ENTITY_ID, item_event_channel};
+                let item_entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = item_event_channel().send(ItemEvent::Spawn {
+                    entity_id: item_entity_id,
+                    item_id: 1,
+                    x: x as f64 + 0.5,
+                    y: y as f64 + 0.5,
+                    z: z as f64 + 0.5,
+                    vx: 0.0,
+                    vy: 0.2,
+                    vz: 0.0,
+                });
+            } else if status == 3 || status == 4 {
+                use super::state::{ItemEvent, NEXT_ENTITY_ID, item_event_channel};
+                let item_entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let yaw_rad = (player.yaw + 90.0) * (std::f32::consts::PI / 180.0);
+                let pitch_rad = -player.pitch * (std::f32::consts::PI / 180.0);
+                let vx = (yaw_rad.cos() * pitch_rad.cos() * 0.3) as f64;
+                let vy = (pitch_rad.sin() * 0.3 + 0.1) as f64;
+                let vz = (yaw_rad.sin() * pitch_rad.cos() * 0.3) as f64;
+
+                let _ = item_event_channel().send(ItemEvent::Spawn {
+                    entity_id: item_entity_id,
+                    item_id: 1,
+                    x: player.x,
+                    y: player.y + 1.5,
+                    z: player.z,
+                    vx,
+                    vy,
+                    vz,
+                });
             }
 
             if sequence > 0 {
@@ -264,6 +298,37 @@ pub async fn handle_play_packet(
                 );
                 if let Ok(pos_payload) = encode_java_packet(&pos_pkt, version) {
                     let _ = write_framed_payload(stream, pos_payload.as_slice()).await;
+                }
+
+                let waiting = CGameEvent::new(GameEvent::StartWaitingChunks, 0.0);
+                if let Ok(payload) = encode_java_packet(&waiting, version) {
+                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                }
+
+                use pumpkin_protocol::java::client::play::{CCenterChunk, CChunkBatchStart, CChunkBatchEnd};
+                let center = CCenterChunk { chunk_x: VarInt(0), chunk_z: VarInt(0) };
+                if let Ok(payload) = encode_java_packet(&center, version) {
+                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                }
+
+                let batch_start = CChunkBatchStart;
+                if let Ok(payload) = encode_java_packet(&batch_start, version) {
+                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                }
+
+                let mut chunk_count = 0u16;
+                let proto_ver = version.protocol_version();
+                for dz in -3i32..=3 {
+                    for dx in -3i32..=3 {
+                        let chunk_data = crate::world::chunk_gen::encode_chunk_packet(dx, dz, proto_ver, db);
+                        let _ = write_framed_payload(stream, &chunk_data).await;
+                        chunk_count += 1;
+                    }
+                }
+
+                let batch_end = CChunkBatchEnd::new(chunk_count);
+                if let Ok(payload) = encode_java_packet(&batch_end, version) {
+                    let _ = write_framed_payload(stream, payload.as_slice()).await;
                 }
 
                 moved = true;
@@ -409,6 +474,8 @@ async fn process_fall_damage(
                 x: player.x,
                 y: player.y,
                 z: player.z,
+                attacker_x: None,
+                attacker_z: None,
             });
         }
         player.highest_y = player.y;

@@ -348,6 +348,7 @@ pub async fn handle_play(
     let mut chat_rx = chat_channel().subscribe();
     let mut block_rx = block_channel().subscribe();
     let mut event_rx = player_event_channel().subscribe();
+    let mut item_rx = crate::viakraken::java::backend::state::item_event_channel().subscribe();
 
     'play: loop {
         tokio::select! {
@@ -444,13 +445,35 @@ pub async fn handle_play(
                             }
                         }
                     }
-                    PlayerEvent::Hurt { entity_id, uuid: target_uuid, damage, x, y, z } => {
+                    PlayerEvent::Hurt { entity_id, uuid: target_uuid, damage, x, y, z, attacker_x, attacker_z } => {
+                        let (kb_x, kb_z) = if let (Some(ax), Some(az)) = (attacker_x, attacker_z) {
+                            let dx = x - ax;
+                            let dz = z - az;
+                            let len = (dx * dx + dz * dz).sqrt();
+                            if len > 0.0 {
+                                (dx / len * 0.4, dz / len * 0.4)
+                            } else {
+                                (0.0, 0.0)
+                            }
+                        } else {
+                            (0.0, 0.0)
+                        };
+
                         if target_uuid == uuid {
                             player.health -= damage;
                             if player.health < 0.0 { player.health = 0.0; }
                             use pumpkin_protocol::java::client::play::CSetHealth;
                             let hp = CSetHealth::new(player.health, VarInt(20), 20.0);
                             if let Ok(payload) = encode_java_packet(&hp, version) {
+                                let _ = write_framed_payload(stream, payload.as_slice()).await;
+                            }
+                            
+                            use pumpkin_protocol::java::client::play::CEntityVelocity;
+                            let vel = CEntityVelocity::new(
+                                VarInt(my_entity_id),
+                                Vector3::new(kb_x, 0.35, kb_z),
+                            );
+                            if let Ok(payload) = encode_java_packet(&vel, version) {
                                 let _ = write_framed_payload(stream, payload.as_slice()).await;
                             }
                         }
@@ -461,7 +484,7 @@ pub async fn handle_play(
                         use pumpkin_protocol::java::client::play::CSoundEffect;
                         use pumpkin_protocol::IdOr;
                         use pumpkin_data::sound::SoundCategory;
-                        let sound_pkt = CSoundEffect::new(
+                        let hurt_sound = CSoundEffect::new(
                             IdOr::Id(pumpkin_data::sound::Sound::EntityPlayerHurt as u16),
                             SoundCategory::Players,
                             &Vector3::new(x, y, z),
@@ -469,8 +492,21 @@ pub async fn handle_play(
                             1.0,
                             12345.0,
                         );
-                        if let Ok(payload) = encode_java_packet(&sound_pkt, version) {
+                        if let Ok(payload) = encode_java_packet(&hurt_sound, version) {
                             let _ = write_framed_payload(stream, payload.as_slice()).await;
+                        }
+                        if attacker_x.is_some() {
+                            let attack_sound = CSoundEffect::new(
+                                IdOr::Id(pumpkin_data::sound::Sound::EntityPlayerAttackStrong as u16),
+                                SoundCategory::Players,
+                                &Vector3::new(x, y, z),
+                                1.0,
+                                1.0,
+                                12345.0,
+                            );
+                            if let Ok(payload) = encode_java_packet(&attack_sound, version) {
+                                let _ = write_framed_payload(stream, payload.as_slice()).await;
+                            }
                         }
                     }
                 }
@@ -480,6 +516,38 @@ pub async fn handle_play(
                 let pkt = pumpkin_protocol::java::client::play::CSystemChatMessage::new(&text_comp, false);
                 if let Ok(payload) = encode_java_packet(&pkt, version) {
                     let _ = write_framed_payload(stream, payload.as_slice()).await;
+                }
+            }
+            Ok(item_event) = item_rx.recv() => {
+                match item_event {
+                    crate::viakraken::java::backend::state::ItemEvent::Spawn { entity_id, item_id: _, x, y, z, vx, vy, vz } => {
+                        let spawn_pkt = CSpawnEntity::new(
+                            VarInt(entity_id),
+                            Uuid::new_v4(),
+                            VarInt(pumpkin_data::entity::EntityType::ITEM.id as i32),
+                            Vector3 { x, y, z },
+                            0.0,
+                            0.0,
+                            0.0,
+                            VarInt(0),
+                            Vector3 { x: 0.0, y: 0.0, z: 0.0 },
+                        );
+                        if let Ok(payload) = encode_java_packet(&spawn_pkt, version) {
+                            let _ = write_framed_payload(stream, payload.as_slice()).await;
+                        }
+
+                        use pumpkin_protocol::java::client::play::CEntityVelocity;
+                        let vel = CEntityVelocity::new(
+                            VarInt(entity_id),
+                            Vector3::new(vx, vy, vz),
+                        );
+                        if let Ok(payload) = encode_java_packet(&vel, version) {
+                            let _ = write_framed_payload(stream, payload.as_slice()).await;
+                        }
+                    }
+                    crate::viakraken::java::backend::state::ItemEvent::Pickup { item_entity_id: _, player_entity_id: _ } => {
+                        // We could send CPickupItem here if we implement picking up
+                    }
                 }
             }
             Ok(block_data) = block_rx.recv() => {

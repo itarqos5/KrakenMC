@@ -57,6 +57,8 @@ pub enum PlayerEvent {
         x: f64,
         y: f64,
         z: f64,
+        attacker_x: Option<f64>,
+        attacker_z: Option<f64>,
     },
 }
 
@@ -88,12 +90,36 @@ pub fn online_players() -> &'static Mutex<HashMap<Uuid, OnlinePlayer>> {
 
 pub static NEXT_ENTITY_ID: AtomicI32 = AtomicI32::new(1);
 
-/// Build abilities byte for a gamemode.
-/// 0=survival, 1=creative, 2=adventure, 3=spectator
 pub fn gamemode_abilities(gamemode: u8) -> (i8, f32) {
     match gamemode {
         1 => (0x01 | 0x04 | 0x08, 0.05), // invulnerable + allow fly + instant break
         3 => (0x02 | 0x04, 0.05),         // flying + allow fly (spectator)
         _ => (0, 0.05),                    // survival/adventure: nothing
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum ItemEvent {
+    Spawn {
+        entity_id: i32,
+        item_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        vx: f64,
+        vy: f64,
+        vz: f64,
+    },
+    Pickup {
+        item_entity_id: i32,
+        player_entity_id: i32,
+    },
+}
+
+pub fn item_event_channel() -> &'static tokio::sync::broadcast::Sender<ItemEvent> {
+    static CHANNEL: OnceLock<tokio::sync::broadcast::Sender<ItemEvent>> = OnceLock::new();
+    CHANNEL.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(500);
+        tx
+    })
 }
