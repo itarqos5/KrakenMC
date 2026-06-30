@@ -39,3 +39,10 @@ strip = true # Further reduces binary size by removing debug symbols
 
 [profile.release.package.pumpkin-world]
 opt-level = 0
+
+[profile.dev]
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
