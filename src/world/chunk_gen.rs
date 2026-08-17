@@ -9,7 +9,7 @@ use noise::{NoiseFn, Perlin};
 use pumpkin_util::version::MinecraftVersion;
 use serde::{Deserialize, Serialize};
 
-const CHUNK_FORMAT_VERSION: u8 = 3;
+const CHUNK_FORMAT_VERSION: u8 = 4;
 const SECTION_COUNT: usize = 24;
 const MIN_Y: i32 = -64;
 const MAX_Y: i32 = 319;
@@ -38,6 +38,7 @@ enum TerrainBiome {
     Ocean,
     SnowyPlains,
     Taiga,
+    Jungle,
     Forest,
     Plains,
     Savanna,
@@ -63,6 +64,7 @@ impl TerrainBiome {
             Self::Ocean => pumpkin_data::biome::Biome::OCEAN.id,
             Self::SnowyPlains => pumpkin_data::biome::Biome::SNOWY_PLAINS.id,
             Self::Taiga => pumpkin_data::biome::Biome::TAIGA.id,
+            Self::Jungle => pumpkin_data::biome::Biome::JUNGLE.id,
             Self::Forest => pumpkin_data::biome::Biome::FOREST.id,
             Self::Plains => pumpkin_data::biome::Biome::PLAINS.id,
             Self::Savanna => pumpkin_data::biome::Biome::SAVANNA.id,
@@ -74,6 +76,7 @@ impl TerrainBiome {
         match self {
             Self::Ocean => 0,
             Self::Forest => 72,
+            Self::Jungle => 88,
             Self::Taiga => 58,
             Self::Plains => 12,
             Self::Savanna => 28,
@@ -305,15 +308,17 @@ fn climate_at(
     let raw_temperature = contextual_noise(temperature_noise, world_x, world_z, 128);
     let moisture = contextual_noise(moisture_noise, world_x, world_z, 112);
     let temperature = (raw_temperature * 0.72 + 0.55).clamp(-0.25, 1.35);
-    let biome = if temperature < 0.18 {
-        if moisture > 0.05 {
+    let biome = if temperature < 0.2 {
+        if moisture > 0.0 {
             TerrainBiome::Taiga
         } else {
             TerrainBiome::SnowyPlains
         }
-    } else if temperature > 1.0 {
-        if moisture < 0.05 {
+    } else if temperature > 0.9 {
+        if moisture < -0.02 {
             TerrainBiome::Desert
+        } else if moisture > 0.22 {
+            TerrainBiome::Jungle
         } else {
             TerrainBiome::Savanna
         }
@@ -345,6 +350,7 @@ fn surface_height_at(
     let biome_offset = match biome {
         TerrainBiome::Ocean => -2.0,
         TerrainBiome::Taiga => 3.0,
+        TerrainBiome::Jungle => 4.0,
         TerrainBiome::Forest => 2.0,
         TerrainBiome::Savanna => 1.0,
         TerrainBiome::Desert => -1.0,
@@ -648,6 +654,20 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
                     chunk.blocks[index] = snow;
                 }
             }
+
+            if biome == TerrainBiome::Desert
+                && surface >= SEA_LEVEL
+                && coordinate_hash(seed ^ 0x4341_4354, world_x, surface, world_z)
+                    .is_multiple_of(211)
+            {
+                let cactus_height =
+                    2 + (coordinate_hash(seed ^ 0x4845_4947, world_x, surface, world_z) % 2) as i32;
+                for y in surface + 1..=surface + cactus_height {
+                    if let Some(index) = block_index(local_x, y, local_z) {
+                        chunk.blocks[index] = pumpkin_data::Block::CACTUS.default_state.id;
+                    }
+                }
+            }
         }
     }
 
@@ -779,6 +799,11 @@ fn place_tree(
             pumpkin_data::Block::ACACIA_LOG.default_state.id,
             pumpkin_data::Block::ACACIA_LEAVES.default_state.id,
             5 + (hash % 2) as i32,
+        ),
+        TerrainBiome::Jungle => (
+            pumpkin_data::Block::JUNGLE_LOG.default_state.id,
+            pumpkin_data::Block::JUNGLE_LEAVES.default_state.id,
+            7 + (hash % 5) as i32,
         ),
         _ => (
             pumpkin_data::Block::OAK_LOG.default_state.id,
@@ -1056,10 +1081,32 @@ mod tests {
         let leaves = [
             pumpkin_data::Block::OAK_LEAVES.default_state.id,
             pumpkin_data::Block::SPRUCE_LEAVES.default_state.id,
+            pumpkin_data::Block::JUNGLE_LEAVES.default_state.id,
             pumpkin_data::Block::ACACIA_LEAVES.default_state.id,
         ];
         assert!(left.blocks.iter().any(|state| leaves.contains(state)));
         assert!(right.blocks.iter().any(|state| leaves.contains(state)));
+    }
+
+    #[test]
+    fn climate_map_contains_requested_biomes() {
+        let temperature_noise = Perlin::new((DEFAULT_WORLD_SEED as u32).wrapping_add(0x51f2));
+        let moisture_noise = Perlin::new((DEFAULT_WORLD_SEED as u32).wrapping_add(0xa913));
+        let mut found = [false; 4];
+
+        for z in (-4096..=4096).step_by(64) {
+            for x in (-4096..=4096).step_by(64) {
+                match climate_at(x, z, &temperature_noise, &moisture_noise).0 {
+                    TerrainBiome::SnowyPlains => found[0] = true,
+                    TerrainBiome::Desert => found[1] = true,
+                    TerrainBiome::Taiga => found[2] = true,
+                    TerrainBiome::Jungle => found[3] = true,
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(found, [true; 4]);
     }
 
     #[test]
