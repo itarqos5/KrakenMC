@@ -203,6 +203,7 @@ pub enum ItemEvent {
     Pickup {
         item_entity_id: i32,
         player_entity_id: i32,
+        count: u8,
     },
 }
 
@@ -212,4 +213,75 @@ pub fn item_event_channel() -> &'static tokio::sync::broadcast::Sender<ItemEvent
         let (tx, _) = tokio::sync::broadcast::channel(500);
         tx
     })
+}
+
+#[derive(Clone, Debug)]
+pub struct DroppedItem {
+    pub entity_id: i32,
+    pub item_id: u16,
+    pub count: u8,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    spawned_at: Instant,
+}
+
+pub fn dropped_items() -> &'static Mutex<HashMap<i32, DroppedItem>> {
+    static ITEMS: OnceLock<Mutex<HashMap<i32, DroppedItem>>> = OnceLock::new();
+    ITEMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn spawn_dropped_item(
+    item_id: u16,
+    count: u8,
+    x: f64,
+    y: f64,
+    z: f64,
+    vx: f64,
+    vy: f64,
+    vz: f64,
+) -> i32 {
+    let entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dropped = DroppedItem {
+        entity_id,
+        item_id,
+        count,
+        x,
+        y,
+        z,
+        spawned_at: Instant::now(),
+    };
+    if let Ok(mut items) = dropped_items().lock() {
+        items.insert(entity_id, dropped);
+    }
+    let _ = item_event_channel().send(ItemEvent::Spawn {
+        entity_id,
+        item_id,
+        count,
+        x,
+        y,
+        z,
+        vx,
+        vy,
+        vz,
+    });
+    entity_id
+}
+
+pub fn claim_nearby_dropped_item(x: f64, y: f64, z: f64) -> Option<DroppedItem> {
+    const PICKUP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+    const PICKUP_RADIUS_SQUARED: f64 = 2.25;
+
+    let mut items = dropped_items().lock().ok()?;
+    let now = Instant::now();
+    let entity_id = items
+        .values()
+        .filter(|item| now.duration_since(item.spawned_at) >= PICKUP_DELAY)
+        .filter_map(|item| {
+            let distance = (item.x - x).powi(2) + (item.y - y).powi(2) + (item.z - z).powi(2);
+            (distance <= PICKUP_RADIUS_SQUARED).then_some((item.entity_id, distance))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(entity_id, _)| entity_id)?;
+    items.remove(&entity_id)
 }

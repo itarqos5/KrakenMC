@@ -286,21 +286,18 @@ pub async fn handle_play_packet(
                 });
 
                 if matches!(player.gamemode, 0 | 2) {
-                    use super::state::{item_event_channel, ItemEvent, NEXT_ENTITY_ID};
+                    use super::state::spawn_dropped_item;
                     if let Some(item) = block_drop_item(broken_state) {
-                        let item_entity_id =
-                            NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let _ = item_event_channel().send(ItemEvent::Spawn {
-                            entity_id: item_entity_id,
-                            item_id: item.id,
-                            count: 1,
-                            x: x as f64 + 0.5,
-                            y: y as f64 + 0.5,
-                            z: z as f64 + 0.5,
-                            vx: 0.0,
-                            vy: 0.2,
-                            vz: 0.0,
-                        });
+                        spawn_dropped_item(
+                            item.id,
+                            1,
+                            x as f64 + 0.5,
+                            y as f64 + 0.5,
+                            z as f64 + 0.5,
+                            0.0,
+                            0.2,
+                            0.0,
+                        );
                     }
                 }
             } else if status == 3 || status == 4 {

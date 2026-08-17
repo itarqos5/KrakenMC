@@ -11,9 +11,9 @@ use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
     ArgumentType, CCenterChunk, CChunkBatchEnd, CChunkBatchStart, CCommands, CCustomPayload,
     CEntityStatus, CGameEvent, CHeadRot, CKeepAlive, CPlayerAbilities, CPlayerInfoUpdate,
-    CPlayerPosition, CPlayerSpawnPosition, CRemoveEntities, CRemovePlayerInfo, CSpawnEntity,
-    CTeleportEntity, CUnloadChunk, GameEvent, Player, PlayerAction, PlayerInfoFlags, ProtoNode,
-    ProtoNodeType,
+    CPlayerPosition, CPlayerSpawnPosition, CRemoveEntities, CRemovePlayerInfo, CSetContainerSlot,
+    CSpawnEntity, CTakeItemEntity, CTeleportEntity, CUnloadChunk, GameEvent, Player, PlayerAction,
+    PlayerInfoFlags, ProtoNode, ProtoNodeType,
 };
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::PositionFlag;
@@ -27,14 +27,52 @@ use crate::operator_store::operator_level;
 use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::utils::{read_varint_from_slice, write_framed_payload};
 use crate::world::chunk_gen::{encode_chunk_packet, has_open_sky};
-use crate::world::player_store::{load_player, save_player};
+use crate::world::player_store::{load_player, save_player, PlayerData};
 
 use super::handler::{change_gamemode, handle_play_packet};
 use super::state::{
-    block_channel, chat_channel, console_command_channel, gamemode_abilities, online_players,
-    player_event_channel, summoned_entities, summoned_entity_channel, ConsoleCommand, OnlinePlayer,
-    PlayerEvent, SummonedEntity, SummonedEntityEvent, NEXT_ENTITY_ID,
+    block_channel, chat_channel, claim_nearby_dropped_item, console_command_channel,
+    gamemode_abilities, item_event_channel, online_players, player_event_channel,
+    summoned_entities, summoned_entity_channel, ConsoleCommand, OnlinePlayer, PlayerEvent,
+    SummonedEntity, SummonedEntityEvent, NEXT_ENTITY_ID,
 };
+
+fn has_empty_drop_slot(player: &PlayerData) -> bool {
+    (36..45)
+        .chain(9..36)
+        .any(|slot| player.inventory.get(slot).is_some_and(Vec::is_empty))
+}
+
+async fn store_dropped_item(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    player: &mut PlayerData,
+    item_id: u16,
+    count: u8,
+) -> std::io::Result<bool> {
+    use pumpkin_data::item_stack::ItemStack;
+    use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
+
+    let Some(item) = pumpkin_data::item::Item::from_id(item_id) else {
+        return Ok(false);
+    };
+    let Some(slot) = (36..45)
+        .chain(9..36)
+        .find(|slot| player.inventory.get(*slot).is_some_and(Vec::is_empty))
+    else {
+        return Ok(false);
+    };
+    let serialized = ItemStackSerializer::from(ItemStack::new(count, item));
+    let mut bytes = Vec::new();
+    serialized
+        .write_with_version(&mut bytes, &version)
+        .map_err(|error| Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    player.inventory[slot] = bytes;
+    let packet = CSetContainerSlot::new(0, 0, slot as i16, &serialized);
+    let payload = encode_java_packet(&packet, version)?;
+    write_framed_payload(stream, payload.as_slice()).await?;
+    Ok(true)
+}
 
 fn world_time_ticks() -> i64 {
     static START: OnceLock<Instant> = OnceLock::new();
@@ -603,6 +641,7 @@ pub async fn handle_play(
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut save_interval = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut entity_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut pickup_interval = tokio::time::interval(std::time::Duration::from_millis(100));
     save_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     save_interval.reset();
     let mut keep_alive_id = 0i64;
@@ -881,8 +920,20 @@ pub async fn handle_play(
                             let _ = write_framed_payload(stream, payload.as_slice()).await;
                         }
                     }
-                    crate::viakraken::java::backend::state::ItemEvent::Pickup { item_entity_id: _, player_entity_id: _ } => {
-                        // We could send CPickupItem here if we implement picking up
+                    crate::viakraken::java::backend::state::ItemEvent::Pickup { item_entity_id, player_entity_id, count } => {
+                        let packet = CTakeItemEntity::new(
+                            VarInt(item_entity_id),
+                            VarInt(player_entity_id),
+                            VarInt(count as i32),
+                        );
+                        if let Ok(payload) = encode_java_packet(&packet, version) {
+                            let _ = write_framed_payload(stream, payload.as_slice()).await;
+                        }
+                        let ids = [VarInt(item_entity_id)];
+                        let packet = CRemoveEntities::new(&ids);
+                        if let Ok(payload) = encode_java_packet(&packet, version) {
+                            let _ = write_framed_payload(stream, payload.as_slice()).await;
+                        }
                     }
                 }
             }
@@ -950,6 +1001,19 @@ pub async fn handle_play(
             }
             _ = entity_interval.tick() => {
                 tick_summoned_zombies(&db);
+            }
+            _ = pickup_interval.tick(), if player.gamemode != 3 && has_empty_drop_slot(&player) => {
+                if let Some(item) = claim_nearby_dropped_item(player.x, player.y + 0.5, player.z) {
+                    if store_dropped_item(stream, version, &mut player, item.item_id, item.count).await? {
+                        let _ = item_event_channel().send(
+                            crate::viakraken::java::backend::state::ItemEvent::Pickup {
+                                item_entity_id: item.entity_id,
+                                player_entity_id: my_entity_id,
+                                count: item.count,
+                            },
+                        );
+                    }
+                }
             }
             _ = interval.tick() => {
                 keep_alive_id = keep_alive_id.wrapping_add(1);
