@@ -36,7 +36,7 @@ impl Default for PlayerData {
             z: 0.0,
             yaw: 0.0,
             pitch: 0.0,
-            gamemode: 1, // creative by default
+            gamemode: 0, // new players start in survival
             inventory: vec![Vec::new(); 46],
             highest_y: 70.0,
             held_slot: 0,
@@ -91,5 +91,13 @@ mod tests {
         assert_eq!((loaded.yaw, loaded.pitch), (123.0, -42.5));
         assert_eq!(loaded.inventory[36], vec![1, 2, 3, 4]);
         assert_eq!(loaded.operator_level, 0);
+    }
+
+    #[test]
+    fn new_players_start_in_survival() {
+        let db = Arc::new(sled::Config::new().temporary(true).open().unwrap());
+        let player = load_player(&db, Uuid::new_v4());
+
+        assert_eq!(player.gamemode, 0);
     }
 }
