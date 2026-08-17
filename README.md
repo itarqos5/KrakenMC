@@ -19,6 +19,7 @@ Kraken is a high-performance Rust-based Minecraft server engine designed for low
 - 🔄 **Player Lifecycle:** Instant respawns, persistent inventory & health tracking, real-time multiplayer tablist synchronization, and interactive `/gamemode` autocompletion.
 - 💾 **Persistence:** Embedded **Sled** storage for player state, compressed generated chunks, biome climate, and block modifications.
 - 🌍 **World Generation:** Contextual biome borders, temperature, caves, depth-aware ores, and cross-chunk trees with on-demand chunk streaming.
+- 👁️ **View Distance:** Honors each client's render-distance preference up to the configurable `view-distance` server limit (default 16).
 
 ## 🚀 Getting Started
 
@@ -89,7 +90,7 @@ By moving synchronous `sysinfo` hardware queries (OS memory and CPU enumeration)
 | File | Purpose |
 |------|---------|
 | `eula.txt` | Mojang EULA acceptance flag. Must be `eula=true` to boot. |
-| `server.properties` | Bind IP, port, target protocol, max players, MOTD. |
+| `server.properties` | Bind IP, port, target protocol, max players, MOTD, and maximum view distance. |
 | `ops.json` | Operator UUIDs, names, permission levels, and player-limit bypass settings. |
 | `world_data/` | Sled database directory for player and chunk persistence. |
 

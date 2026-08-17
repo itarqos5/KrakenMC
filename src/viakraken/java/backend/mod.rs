@@ -4,11 +4,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
-use pumpkin_protocol::java::client::config::{CFinishConfig, CKnownPacks, CRegistryData, RegistryEntry, CUpdateTags};
+use pumpkin_protocol::java::client::config::{
+    CFinishConfig, CKnownPacks, CRegistryData, CUpdateTags, RegistryEntry,
+};
 use pumpkin_protocol::java::client::login::CLoginSuccess;
-use pumpkin_protocol::java::server::config::SAcknowledgeFinishConfig;
+use pumpkin_protocol::java::server::config::{SAcknowledgeFinishConfig, SClientInformationConfig};
 use pumpkin_protocol::java::server::login::SLoginAcknowledged;
-use pumpkin_protocol::{KnownPack, Property};
+use pumpkin_protocol::{KnownPack, Property, ServerPacket};
 use pumpkin_util::version::MinecraftVersion;
 
 use crate::config::ServerConfig;
@@ -16,14 +18,16 @@ use crate::logger::{log_info, log_warn};
 use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::java::protocol::{parse_handshake, parse_login_start};
 use crate::viakraken::java::support::{
-    minecraft_version_from_protocol, packet_id_for_version, strict_error_handling,
-    send_status_response_direct,
+    minecraft_version_from_protocol, packet_id_for_version, send_status_response_direct,
+    strict_error_handling,
 };
-use crate::viakraken::utils::{packet_id, read_packet, read_varint_from_slice, write_framed_payload};
+use crate::viakraken::utils::{
+    packet_id, read_packet, read_varint_from_slice, write_framed_payload,
+};
 
-pub mod state;
 pub mod handler;
 pub mod play;
+pub mod state;
 
 pub async fn run_backend_listener(
     listener: TcpListener,
@@ -142,23 +146,35 @@ async fn handle_login(
     ];
 
     if version.protocol_version() >= MinecraftVersion::V_1_21_11.protocol_version() {
-        if let Some(map) = pumpkin_data::tag::get_registry_key_tags(version, pumpkin_data::tag::RegistryKey::Timeline) {
+        if let Some(map) = pumpkin_data::tag::get_registry_key_tags(
+            version,
+            pumpkin_data::tag::RegistryKey::Timeline,
+        ) {
             if !map.is_empty() {
                 tags.push(pumpkin_data::tag::RegistryKey::Timeline);
             }
         }
     }
-    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(version, pumpkin_data::tag::RegistryKey::DimensionType) {
+    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(
+        version,
+        pumpkin_data::tag::RegistryKey::DimensionType,
+    ) {
         if !map.is_empty() {
             tags.push(pumpkin_data::tag::RegistryKey::DimensionType);
         }
     }
-    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(version, pumpkin_data::tag::RegistryKey::DamageType) {
+    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(
+        version,
+        pumpkin_data::tag::RegistryKey::DamageType,
+    ) {
         if !map.is_empty() {
             tags.push(pumpkin_data::tag::RegistryKey::DamageType);
         }
     }
-    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(version, pumpkin_data::tag::RegistryKey::BannerPattern) {
+    if let Some(map) = pumpkin_data::tag::get_registry_key_tags(
+        version,
+        pumpkin_data::tag::RegistryKey::BannerPattern,
+    ) {
         if !map.is_empty() {
             tags.push(pumpkin_data::tag::RegistryKey::BannerPattern);
         }
@@ -173,15 +189,31 @@ async fn handle_login(
     write_framed_payload(stream, finish_config_payload.as_slice()).await?;
 
     let mut entered_play = false;
+    let mut client_view_distance = config.view_distance;
     let config_finish_id =
         packet_id_for_version::<SAcknowledgeFinishConfig>(version, "config-finish")?;
+    let client_information_id =
+        packet_id_for_version::<SClientInformationConfig>(version, "config-client-information")?;
     while let Ok(Ok(config_packet)) = timeout(Duration::from_secs(15), read_packet(stream)).await {
-        let finish_id = packet_id(&config_packet)?;
-        if finish_id == config_finish_id {
+        let mut offset = 0;
+        let incoming_id = read_varint_from_slice(&config_packet, &mut offset)?;
+        if incoming_id == config_finish_id {
             entered_play = true;
             break;
+        } else if incoming_id == client_information_id {
+            if let Ok(settings) = SClientInformationConfig::read(
+                &mut std::io::Cursor::new(&config_packet[offset..]),
+                &version,
+            ) {
+                client_view_distance =
+                    i32::from(settings.view_distance).clamp(2, config.view_distance);
+            }
         } else {
-            log_info!("Received client config packet: id={} for {}", finish_id, username);
+            log_info!(
+                "Received client config packet: id={} for {}",
+                incoming_id,
+                username
+            );
         }
     }
 
@@ -193,5 +225,15 @@ async fn handle_login(
         return Ok(());
     }
 
-    play::handle_play(stream, config, version, protocol_version, &username, profile_uuid, db).await
+    play::handle_play(
+        stream,
+        config,
+        version,
+        protocol_version,
+        &username,
+        profile_uuid,
+        db,
+        client_view_distance,
+    )
+    .await
 }

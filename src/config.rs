@@ -9,6 +9,7 @@ pub struct ServerConfig {
     pub server_ip: String,
     pub server_port: u16,
     pub target_protocol: i32,
+    pub view_distance: i32,
     pub motd: String,
 }
 
@@ -19,6 +20,7 @@ impl Default for ServerConfig {
             server_ip: "0.0.0.0".to_string(),
             server_port: 25565,
             target_protocol: 776,
+            view_distance: 16,
             motd: "Welcome to Kraken!".to_string(),
         }
     }
@@ -64,6 +66,7 @@ pub fn enforce_eula_gate() -> ServerConfig {
             writeln!(file, "server-port={}", defaults.server_port).unwrap();
             writeln!(file, "target-protocol={}", defaults.target_protocol).unwrap();
             writeln!(file, "max-players={}", defaults.max_players).unwrap();
+            writeln!(file, "view-distance={}", defaults.view_distance).unwrap();
             writeln!(file, "motd={}", defaults.motd).unwrap();
             log_info!("Created server.properties");
         }
@@ -105,6 +108,7 @@ pub fn enforce_eula_gate() -> ServerConfig {
         writeln!(file, "server-port={}", config.server_port).unwrap();
         writeln!(file, "target-protocol={}", config.target_protocol).unwrap();
         writeln!(file, "max-players={}", config.max_players).unwrap();
+        writeln!(file, "view-distance={}", config.view_distance).unwrap();
         writeln!(file, "motd={}", config.motd).unwrap();
         log_info!("Created server.properties");
     } else {
@@ -120,6 +124,9 @@ pub fn enforce_eula_gate() -> ServerConfig {
                     "server-port" => config.server_port = v.trim().parse().unwrap_or(25565),
                     "target-protocol" => config.target_protocol = v.trim().parse().unwrap_or(776),
                     "max-players" => config.max_players = v.trim().parse().unwrap_or(1000),
+                    "view-distance" => {
+                        config.view_distance = v.trim().parse::<i32>().unwrap_or(16).clamp(2, 32)
+                    }
                     "motd" => config.motd = v.trim().to_string(),
                     _ => {}
                 }

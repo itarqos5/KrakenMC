@@ -32,8 +32,6 @@ use super::state::{
     player_event_channel, ConsoleCommand, OnlinePlayer, PlayerEvent, NEXT_ENTITY_ID,
 };
 
-const VIEW_DISTANCE: i32 = 3;
-
 async fn send_permission_status(
     stream: &mut TcpStream,
     version: MinecraftVersion,
@@ -115,11 +113,11 @@ fn chunk_coordinate(block_coordinate: f64) -> i32 {
     (block_coordinate.floor() as i32) >> 4
 }
 
-fn chunks_in_view(center_x: i32, center_z: i32) -> HashSet<(i32, i32)> {
-    let diameter = (VIEW_DISTANCE * 2 + 1) as usize;
+fn chunks_in_view(center_x: i32, center_z: i32, view_distance: i32) -> HashSet<(i32, i32)> {
+    let diameter = (view_distance * 2 + 1) as usize;
     let mut chunks = HashSet::with_capacity(diameter * diameter);
-    for dz in -VIEW_DISTANCE..=VIEW_DISTANCE {
-        for dx in -VIEW_DISTANCE..=VIEW_DISTANCE {
+    for dz in -view_distance..=view_distance {
+        for dx in -view_distance..=view_distance {
             chunks.insert((center_x + dx, center_z + dz));
         }
     }
@@ -134,6 +132,7 @@ async fn stream_chunks(
     center_x: i32,
     center_z: i32,
     sent_chunks: &mut HashSet<(i32, i32)>,
+    view_distance: i32,
 ) -> std::io::Result<()> {
     let center = CCenterChunk {
         chunk_x: VarInt(center_x),
@@ -142,7 +141,7 @@ async fn stream_chunks(
     let payload = encode_java_packet(&center, version)?;
     write_framed_payload(stream, payload.as_slice()).await?;
 
-    let desired_chunks = chunks_in_view(center_x, center_z);
+    let desired_chunks = chunks_in_view(center_x, center_z, view_distance);
     for &(chunk_x, chunk_z) in sent_chunks.difference(&desired_chunks) {
         let unload = CUnloadChunk::new(chunk_x, chunk_z);
         let payload = encode_java_packet(&unload, version)?;
@@ -194,6 +193,7 @@ pub async fn handle_play(
     username: &str,
     uuid: Uuid,
     db: Arc<sled::Db>,
+    view_distance: i32,
 ) -> std::io::Result<()> {
     let mut player = load_player(&db, uuid);
     player.operator_level = operator_level(uuid, username);
@@ -208,8 +208,8 @@ pub async fn handle_play(
         false,
         vec!["minecraft:overworld".to_string()],
         VarInt(3),
-        VarInt(8),
-        VarInt(8),
+        VarInt(view_distance),
+        VarInt(view_distance.min(12)),
         false,
         true,
         false,
@@ -429,6 +429,7 @@ pub async fn handle_play(
         center_chunk.0,
         center_chunk.1,
         &mut sent_chunks,
+        view_distance,
     )
     .await?;
 
@@ -787,6 +788,7 @@ pub async fn handle_play(
                                     current_chunk.0,
                                     current_chunk.1,
                                     &mut sent_chunks,
+                                    view_distance,
                                 )
                                 .await
                                 {
@@ -843,11 +845,16 @@ mod tests {
 
     #[test]
     fn moving_one_chunk_only_requests_the_new_edge() {
-        let old_view = chunks_in_view(0, 0);
-        let new_view = chunks_in_view(1, 0);
+        let old_view = chunks_in_view(0, 0, 3);
+        let new_view = chunks_in_view(1, 0, 3);
 
         assert_eq!(old_view.len(), 49);
         assert_eq!(new_view.difference(&old_view).count(), 7);
         assert_eq!(old_view.difference(&new_view).count(), 7);
+    }
+
+    #[test]
+    fn client_view_distance_controls_streaming_radius() {
+        assert_eq!(chunks_in_view(0, 0, 12).len(), 625);
     }
 }
