@@ -32,7 +32,7 @@ use super::state::{
     player_event_channel, ConsoleCommand, OnlinePlayer, PlayerEvent, NEXT_ENTITY_ID,
 };
 
-async fn send_permission_status(
+pub(super) async fn send_permission_status(
     stream: &mut TcpStream,
     version: MinecraftVersion,
     entity_id: i32,
@@ -43,7 +43,7 @@ async fn send_permission_status(
     write_framed_payload(stream, payload.as_slice()).await
 }
 
-async fn send_command_tree(
+pub(super) async fn send_command_tree(
     stream: &mut TcpStream,
     version: MinecraftVersion,
     is_operator: bool,

@@ -21,6 +21,7 @@ use crate::viakraken::utils::{read_varint_from_slice, write_framed_payload};
 use crate::world::chunk_gen::{get_block_state, save_block_change};
 use crate::world::player_store::PlayerData;
 
+use super::play::{send_command_tree, send_permission_status};
 use super::state::{
     block_channel, chat_channel, gamemode_abilities, online_players, player_event_channel,
     BlockUpdateEvent, PlayerEvent,
@@ -444,6 +445,10 @@ pub async fn handle_play_packet(
                 if let Ok(hp_payload) = encode_java_packet(&hp, version) {
                     let _ = write_framed_payload(stream, hp_payload.as_slice()).await;
                 }
+
+                send_permission_status(stream, version, my_entity_id, player.operator_level)
+                    .await?;
+                send_command_tree(stream, version, player.operator_level > 0).await?;
 
                 let pos_pkt = CPlayerPosition::new(
                     VarInt(1),
