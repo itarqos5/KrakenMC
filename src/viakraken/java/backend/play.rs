@@ -7,10 +7,11 @@ use uuid::Uuid;
 
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
-    CCenterChunk, CChunkBatchEnd, CChunkBatchStart, CCommands, CCustomPayload, CEntityStatus,
-    CGameEvent, CHeadRot, CKeepAlive, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition,
-    CPlayerSpawnPosition, CRemoveEntities, CRemovePlayerInfo, CSpawnEntity, CTeleportEntity,
-    CUnloadChunk, GameEvent, Player, PlayerAction, PlayerInfoFlags, ProtoNode, ProtoNodeType,
+    ArgumentType, CCenterChunk, CChunkBatchEnd, CChunkBatchStart, CCommands, CCustomPayload,
+    CEntityStatus, CGameEvent, CHeadRot, CKeepAlive, CPlayerAbilities, CPlayerInfoUpdate,
+    CPlayerPosition, CPlayerSpawnPosition, CRemoveEntities, CRemovePlayerInfo, CSpawnEntity,
+    CTeleportEntity, CUnloadChunk, GameEvent, Player, PlayerAction, PlayerInfoFlags, ProtoNode,
+    ProtoNodeType,
 };
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::PositionFlag;
@@ -49,7 +50,7 @@ pub(super) async fn send_command_tree(
     is_operator: bool,
 ) -> std::io::Result<()> {
     let root_children = if is_operator {
-        vec![VarInt(1)]
+        vec![VarInt(1), VarInt(2)]
     } else {
         Vec::new()
     };
@@ -59,12 +60,43 @@ pub(super) async fn send_command_tree(
             node_type: ProtoNodeType::Root,
         },
         ProtoNode {
-            children: vec![VarInt(2), VarInt(3), VarInt(4), VarInt(5)].into_boxed_slice(),
+            children: vec![VarInt(5), VarInt(6), VarInt(7), VarInt(8)].into_boxed_slice(),
             node_type: ProtoNodeType::Literal {
                 name: "gamemode",
                 is_executable: false,
                 redirect_target: None,
                 restricted: true,
+            },
+        },
+        ProtoNode {
+            children: vec![VarInt(3)].into_boxed_slice(),
+            node_type: ProtoNodeType::Literal {
+                name: "summon",
+                is_executable: false,
+                redirect_target: None,
+                restricted: true,
+            },
+        },
+        ProtoNode {
+            children: vec![VarInt(4)].into_boxed_slice(),
+            node_type: ProtoNodeType::Argument {
+                name: "entity",
+                is_executable: true,
+                redirect_target: None,
+                parser: ArgumentType::ResourceLocation,
+                override_suggestion_type: None,
+                restricted: false,
+            },
+        },
+        ProtoNode {
+            children: vec![].into_boxed_slice(),
+            node_type: ProtoNodeType::Argument {
+                name: "pos",
+                is_executable: true,
+                redirect_target: None,
+                parser: ArgumentType::Vec3,
+                override_suggestion_type: None,
+                restricted: false,
             },
         },
         ProtoNode {

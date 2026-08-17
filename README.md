@@ -72,7 +72,7 @@ Commands may be entered with or without the leading slash:
 | `/deop <player>` | Remove operator status. |
 | `/kill <player>` | Kill an online player. |
 | `/gamemode <mode> <player>` | Change an online player's game mode. |
-| `/summon <entity> [x y z]` | Summon a registered entity; coordinates default to `0.5 70 0.5`. |
+| `/summon <entity> [x y z]` | Summon a registered entity; console defaults to `0 0 0`. In-game use defaults to the executing player's position. |
 
 ## 🏗️ Technical Architecture
 

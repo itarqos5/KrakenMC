@@ -23,8 +23,8 @@ use crate::world::player_store::PlayerData;
 
 use super::play::{send_command_tree, send_permission_status};
 use super::state::{
-    block_channel, chat_channel, gamemode_abilities, online_players, player_event_channel,
-    BlockUpdateEvent, PlayerEvent,
+    block_channel, chat_channel, console_command_channel, gamemode_abilities, online_players,
+    player_event_channel, BlockUpdateEvent, ConsoleCommand, PlayerEvent, NEXT_ENTITY_ID,
 };
 
 const PLAYER_INVENTORY_SLOTS: usize = 46;
@@ -623,6 +623,57 @@ async fn handle_command(
                 )
                 .await?;
             }
+        } else if parts[0] == "summon" && matches!(parts.len(), 2 | 5) {
+            if player.operator_level == 0 {
+                send_system_message(
+                    stream,
+                    version,
+                    "You do not have permission to use this command.",
+                )
+                .await?;
+                return Ok(());
+            }
+            let entity_name = parts[1].strip_prefix("minecraft:").unwrap_or(parts[1]);
+            let Some(entity_type) = pumpkin_data::entity::EntityType::from_name(entity_name) else {
+                send_system_message(stream, version, "Unknown entity type.").await?;
+                return Ok(());
+            };
+            if !entity_type.summonable || entity_type == &pumpkin_data::entity::EntityType::PLAYER {
+                send_system_message(stream, version, "That entity cannot be summoned.").await?;
+                return Ok(());
+            }
+            let coordinates = if parts.len() == 5 {
+                let parsed = parts[2..5]
+                    .iter()
+                    .map(|value| value.parse::<f64>())
+                    .collect::<Result<Vec<_>, _>>();
+                let Ok(values) = parsed else {
+                    send_system_message(stream, version, "Summon coordinates must be numbers.")
+                        .await?;
+                    return Ok(());
+                };
+                (values[0], values[1], values[2])
+            } else {
+                (player.x, player.y, player.z)
+            };
+            let entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = console_command_channel().send(ConsoleCommand::Summon {
+                entity_id,
+                entity_type: entity_type.id,
+                x: coordinates.0,
+                y: coordinates.1,
+                z: coordinates.2,
+            });
+            send_system_message(
+                stream,
+                version,
+                &format!(
+                    "Summoned {} at {:.1}, {:.1}, {:.1}",
+                    entity_name, coordinates.0, coordinates.1, coordinates.2
+                ),
+            )
+            .await?;
+            log_info!("{}: /{}", username, cmd);
         } else {
             send_system_message(stream, version, &format!("Unknown command: /{}", cmd)).await?;
         }

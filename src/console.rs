@@ -103,7 +103,7 @@ fn execute(input: &str) {
                 };
                 (values[0], values[1], values[2])
             } else {
-                (0.5, 70.0, 0.5)
+                (0.0, 0.0, 0.0)
             };
             let entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = console_command_channel().send(ConsoleCommand::Summon {
@@ -182,7 +182,7 @@ fn print_help() {
     log_info!("  /deop <player>                Remove operator status");
     log_info!("  /kill <player>                Kill an online player");
     log_info!("  /gamemode <mode> <player>     Set survival/creative/adventure/spectator");
-    log_info!("  /summon <entity> [x y z]      Summon an entity (default: 0.5 70 0.5)");
+    log_info!("  /summon <entity> [x y z]      Summon an entity (default: 0 0 0)");
 }
 
 #[cfg(test)]
