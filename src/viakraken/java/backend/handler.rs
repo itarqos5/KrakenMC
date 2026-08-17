@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -6,13 +5,12 @@ use uuid::Uuid;
 use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
-    CAcknowledgeBlockChange, CBlockUpdate, CGameEvent, CPlayerAbilities, CPlayerInfoUpdate,
-    CPlayerPosition, CRespawn, CSetContainerSlot, CSetSelectedSlot, CSystemChatMessage, GameEvent,
-    Player, PlayerAction, PlayerInfoFlags,
+    CAcknowledgeBlockChange, CGameEvent, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition,
+    CRespawn, CSetContainerSlot, CSetSelectedSlot, CSystemChatMessage, GameEvent, Player,
+    PlayerAction, PlayerInfoFlags,
 };
 use pumpkin_protocol::java::server::play::SChatMessage;
 use pumpkin_protocol::ServerPacket;
-use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::version::MinecraftVersion;
@@ -25,7 +23,7 @@ use crate::world::player_store::PlayerData;
 
 use super::state::{
     block_channel, chat_channel, gamemode_abilities, online_players, player_event_channel,
-    PlayerEvent,
+    BlockUpdateEvent, PlayerEvent,
 };
 
 const PLAYER_INVENTORY_SLOTS: usize = 46;
@@ -109,15 +107,12 @@ pub async fn handle_play_packet(
 
             if let Some(block_id) = held_block_state(player, pkt.hand.0, version) {
                 save_block_change(db, nx, ny, nz, block_id);
-                let place_pos = BlockPos(Vector3 {
+                let _ = block_channel().send(BlockUpdateEvent {
                     x: nx,
                     y: ny,
                     z: nz,
+                    state_id: block_id,
                 });
-                let block_update = CBlockUpdate::new(place_pos, VarInt(block_id as i32));
-                let block_update_payload = encode_java_packet(&block_update, version)?;
-                let _ =
-                    block_channel().send(Bytes::copy_from_slice(block_update_payload.as_slice()));
             }
 
             if pkt.sequence.0 > 0 {
@@ -221,11 +216,12 @@ pub async fn handle_play_packet(
 
             if status == 2 || (status == 0 && player.gamemode == 1) {
                 save_block_change(db, x, y, z, 0);
-                let block_update = CBlockUpdate::new(BlockPos(Vector3 { x, y, z }), VarInt(0));
-                if let Ok(block_update_payload) = encode_java_packet(&block_update, version) {
-                    let _ =
-                        block_channel().send(Bytes::from(block_update_payload.as_slice().to_vec()));
-                }
+                let _ = block_channel().send(BlockUpdateEvent {
+                    x,
+                    y,
+                    z,
+                    state_id: pumpkin_data::Block::AIR.default_state.id,
+                });
 
                 if player.gamemode != 1 {
                     use super::state::{item_event_channel, ItemEvent, NEXT_ENTITY_ID};

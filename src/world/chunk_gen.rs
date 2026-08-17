@@ -720,8 +720,10 @@ fn build_chunk_packet(
 }
 
 fn write_block_palette(buf: &mut Vec<u8>, blocks: &[u16], version: MinecraftVersion) {
-    let first = blocks[0];
-    if blocks.iter().all(|state| *state == first) {
+    let remap =
+        |state| pumpkin_data::block_state_remap::remap_block_state_for_version(state, version);
+    let first = remap(blocks[0]);
+    if blocks.iter().all(|state| remap(*state) == first) {
         buf.push(0);
         write_vi(buf, first as i32);
         if version <= MinecraftVersion::V_1_21_4 {
@@ -734,7 +736,9 @@ fn write_block_palette(buf: &mut Vec<u8>, blocks: &[u16], version: MinecraftVers
     let values_per_long = 64 / BITS;
     let mut packed = vec![0i64; blocks.len().div_ceil(values_per_long)];
     for (index, state) in blocks.iter().enumerate() {
-        packed[index / values_per_long] |= (*state as i64) << ((index % values_per_long) * BITS);
+        let network_state = remap(*state);
+        packed[index / values_per_long] |=
+            (network_state as i64) << ((index % values_per_long) * BITS);
     }
     buf.push(BITS as u8);
     if version <= MinecraftVersion::V_1_21_4 {
@@ -773,6 +777,30 @@ fn write_biome_palette(buf: &mut Vec<u8>, chunk: &SavedChunk, version: Minecraft
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_states_are_remapped_for_older_clients() {
+        let version = MinecraftVersion::V_1_21_4;
+        for block in [
+            &pumpkin_data::Block::GRASS_BLOCK,
+            &pumpkin_data::Block::SNOW,
+            &pumpkin_data::Block::COPPER_ORE,
+            &pumpkin_data::Block::DEEPSLATE,
+        ] {
+            let canonical = block.default_state.id;
+            let network =
+                pumpkin_data::block_state_remap::remap_block_state_for_version(canonical, version);
+            assert_ne!(network, 0, "{} remapped to air", block.name);
+        }
+        assert_ne!(
+            pumpkin_data::Block::COPPER_ORE.default_state.id,
+            pumpkin_data::block_state_remap::remap_block_state_for_version(
+                pumpkin_data::Block::COPPER_ORE.default_state.id,
+                version,
+            ),
+            "the regression requires a non-identity legacy mapping"
+        );
+    }
 
     #[test]
     fn generated_chunks_are_saved_and_stable() {

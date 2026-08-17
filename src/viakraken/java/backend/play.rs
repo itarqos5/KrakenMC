@@ -686,8 +686,22 @@ pub async fn handle_play(
                     }
                 }
             }
-            Ok(block_data) = block_rx.recv() => {
-                let _ = write_framed_payload(stream, &block_data).await;
+            Ok(block_update) = block_rx.recv() => {
+                let network_state = pumpkin_data::block_state_remap::remap_block_state_for_version(
+                    block_update.state_id,
+                    version,
+                );
+                let packet = pumpkin_protocol::java::client::play::CBlockUpdate::new(
+                    BlockPos(Vector3 {
+                        x: block_update.x,
+                        y: block_update.y,
+                        z: block_update.z,
+                    }),
+                    VarInt(network_state as i32),
+                );
+                if let Ok(payload) = encode_java_packet(&packet, version) {
+                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                }
             }
             _ = interval.tick() => {
                 keep_alive_id = keep_alive_id.wrapping_add(1);

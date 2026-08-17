@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Mutex, OnceLock};
@@ -12,8 +11,17 @@ pub fn chat_channel() -> &'static tokio::sync::broadcast::Sender<String> {
     })
 }
 
-pub fn block_channel() -> &'static tokio::sync::broadcast::Sender<Bytes> {
-    static CHANNEL: OnceLock<tokio::sync::broadcast::Sender<Bytes>> = OnceLock::new();
+#[derive(Clone, Copy, Debug)]
+pub struct BlockUpdateEvent {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// Canonical block-state ID from Pumpkin's current registry.
+    pub state_id: u16,
+}
+
+pub fn block_channel() -> &'static tokio::sync::broadcast::Sender<BlockUpdateEvent> {
+    static CHANNEL: OnceLock<tokio::sync::broadcast::Sender<BlockUpdateEvent>> = OnceLock::new();
     CHANNEL.get_or_init(|| {
         let (tx, _) = tokio::sync::broadcast::channel(1024);
         tx
