@@ -24,8 +24,8 @@ use crate::world::player_store::PlayerData;
 use super::play::{send_command_tree, send_permission_status, store_inventory_item};
 use super::state::{
     block_channel, chat_channel, console_command_channel, gamemode_abilities, online_players,
-    player_event_channel, register_summoned_entity, BlockUpdateEvent, ConsoleCommand, PlayerEvent,
-    NEXT_ENTITY_ID,
+    player_event_channel, register_summoned_entity, spawn_dropped_item, BlockUpdateEvent,
+    ConsoleCommand, PlayerEvent, NEXT_ENTITY_ID,
 };
 
 const PLAYER_INVENTORY_SLOTS: usize = 46;
@@ -387,15 +387,60 @@ async fn send_inventory_content(
     write_framed_payload(stream, packet.as_slice()).await
 }
 
-fn held_block_state(player: &PlayerData, hand: i32, version: MinecraftVersion) -> Option<u16> {
-    let inventory_index = match hand {
+fn held_inventory_slot(player: &PlayerData, hand: i32) -> Option<usize> {
+    Some(match hand {
         0 if player.held_slot < HOTBAR_SLOT_COUNT => HOTBAR_START_SLOT + player.held_slot as usize,
         1 => PLAYER_INVENTORY_SLOTS - 1,
         _ => return None,
-    };
+    })
+}
+
+fn held_block_state(player: &PlayerData, hand: i32, version: MinecraftVersion) -> Option<u16> {
+    let inventory_index = held_inventory_slot(player, hand)?;
     let slot = player.inventory.get(inventory_index)?;
     let item_id = inventory_item_id(slot, version)?;
     pumpkin_data::Block::from_item_id(item_id).map(|block| block.default_state.id)
+}
+
+fn remove_inventory_items(
+    player: &mut PlayerData,
+    slot: usize,
+    requested: u8,
+    version: MinecraftVersion,
+) -> std::io::Result<Option<(&'static pumpkin_data::item::Item, u8, u8)>> {
+    let Some((item, count)) = player
+        .inventory
+        .get(slot)
+        .and_then(|stack| inventory_stack(stack, version))
+    else {
+        return Ok(None);
+    };
+    let removed = requested.min(count);
+    let remaining = count - removed;
+    player.inventory[slot] = if remaining == 0 {
+        Vec::new()
+    } else {
+        serialized_stack(item, remaining, version)?
+    };
+    Ok(Some((item, removed, remaining)))
+}
+
+async fn send_inventory_slot(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    slot: usize,
+    item: &'static pumpkin_data::item::Item,
+    count: u8,
+) -> std::io::Result<()> {
+    let stack = if count == 0 {
+        pumpkin_data::item_stack::ItemStack::EMPTY.clone()
+    } else {
+        pumpkin_data::item_stack::ItemStack::new(count, item)
+    };
+    let serialized = ItemStackSerializer::from(stack);
+    let update = CSetContainerSlot::new(0, 0, slot as i16, &serialized);
+    let payload = encode_java_packet(&update, version)?;
+    write_framed_payload(stream, payload.as_slice()).await
 }
 
 fn block_drop_item(state_id: u16) -> Option<&'static pumpkin_data::item::Item> {
@@ -516,6 +561,16 @@ pub async fn handle_play_packet(
                     z: nz,
                     state_id: block_id,
                 });
+
+                if player.gamemode != 1 {
+                    if let Some(slot) = held_inventory_slot(player, pkt.hand.0) {
+                        if let Some((item, _, remaining)) =
+                            remove_inventory_items(player, slot, 1, version)?
+                        {
+                            send_inventory_slot(stream, version, slot, item, remaining).await?;
+                        }
+                    }
+                }
             }
 
             if pkt.sequence.0 > 0 {
@@ -648,7 +703,6 @@ pub async fn handle_play_packet(
                 });
 
                 if matches!(player.gamemode, 0 | 2) {
-                    use super::state::spawn_dropped_item;
                     if let Some(item) = block_drop_item(broken_state) {
                         spawn_dropped_item(
                             item.id,
@@ -663,26 +717,28 @@ pub async fn handle_play_packet(
                     }
                 }
             } else if status == 3 || status == 4 {
-                use super::state::{item_event_channel, ItemEvent, NEXT_ENTITY_ID};
-                let item_entity_id =
-                    NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let yaw_rad = (player.yaw + 90.0) * (std::f32::consts::PI / 180.0);
-                let pitch_rad = -player.pitch * (std::f32::consts::PI / 180.0);
-                let vx = (yaw_rad.cos() * pitch_rad.cos() * 0.3) as f64;
-                let vy = (pitch_rad.sin() * 0.3 + 0.1) as f64;
-                let vz = (yaw_rad.sin() * pitch_rad.cos() * 0.3) as f64;
-
-                let _ = item_event_channel().send(ItemEvent::Spawn {
-                    entity_id: item_entity_id,
-                    item_id: 1,
-                    count: 1,
-                    x: player.x,
-                    y: player.y + 1.5,
-                    z: player.z,
-                    vx,
-                    vy,
-                    vz,
-                });
+                let slot = HOTBAR_START_SLOT + player.held_slot.min(8) as usize;
+                let requested = if status == 3 { 1 } else { u8::MAX };
+                if let Some((item, removed, remaining)) =
+                    remove_inventory_items(player, slot, requested, version)?
+                {
+                    let yaw_rad = (player.yaw + 90.0) * (std::f32::consts::PI / 180.0);
+                    let pitch_rad = -player.pitch * (std::f32::consts::PI / 180.0);
+                    let vx = (yaw_rad.cos() * pitch_rad.cos() * 0.3) as f64;
+                    let vy = (pitch_rad.sin() * 0.3 + 0.1) as f64;
+                    let vz = (yaw_rad.sin() * pitch_rad.cos() * 0.3) as f64;
+                    spawn_dropped_item(
+                        item.id,
+                        removed,
+                        player.x,
+                        player.y + 1.5,
+                        player.z,
+                        vx,
+                        vy,
+                        vz,
+                    );
+                    send_inventory_slot(stream, version, slot, item, remaining).await?;
+                }
             }
 
             if sequence > 0 {
@@ -1143,6 +1199,43 @@ mod tests {
     fn empty_hand_has_no_placeable_block() {
         let player = PlayerData::default();
         assert_eq!(held_block_state(&player, 0, MinecraftVersion::V_26_1), None);
+    }
+
+    #[test]
+    fn held_crafting_table_resolves_to_the_crafting_table_block() {
+        let version = MinecraftVersion::V_26_1;
+        let mut player = PlayerData::default();
+        player.inventory[HOTBAR_START_SLOT] =
+            serialized_stack(&pumpkin_data::item::Item::CRAFTING_TABLE, 1, version).unwrap();
+
+        assert_eq!(
+            held_block_state(&player, 0, version),
+            Some(pumpkin_data::Block::CRAFTING_TABLE.default_state.id)
+        );
+    }
+
+    #[test]
+    fn removing_items_updates_the_authoritative_stack() {
+        let version = MinecraftVersion::V_26_1;
+        let mut player = PlayerData::default();
+        let slot = HOTBAR_START_SLOT + 3;
+        player.inventory[slot] =
+            serialized_stack(&pumpkin_data::item::Item::DIRT, 2, version).unwrap();
+
+        let (_, removed, remaining) = remove_inventory_items(&mut player, slot, 1, version)
+            .unwrap()
+            .unwrap();
+        assert_eq!((removed, remaining), (1, 1));
+        assert_eq!(
+            inventory_stack(&player.inventory[slot], version).map(|(item, count)| (item.id, count)),
+            Some((pumpkin_data::item::Item::DIRT.id, 1))
+        );
+
+        let (_, removed, remaining) = remove_inventory_items(&mut player, slot, u8::MAX, version)
+            .unwrap()
+            .unwrap();
+        assert_eq!((removed, remaining), (1, 0));
+        assert!(player.inventory[slot].is_empty());
     }
 
     #[test]
