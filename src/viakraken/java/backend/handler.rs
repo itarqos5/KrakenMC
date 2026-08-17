@@ -29,6 +29,7 @@ use super::state::{
 const PLAYER_INVENTORY_SLOTS: usize = 46;
 const HOTBAR_START_SLOT: usize = 36;
 const HOTBAR_SLOT_COUNT: u8 = 9;
+const VOID_KILL_Y: f64 = -128.0;
 
 fn inventory_item_id(slot: &[u8], version: MinecraftVersion) -> Option<u16> {
     let mut offset = 0;
@@ -72,6 +73,44 @@ fn block_drop_item(state_id: u16) -> Option<&'static pumpkin_data::item::Item> {
         _ => return None,
     };
     Some(item)
+}
+
+fn is_void_lethal(y: f64) -> bool {
+    y <= VOID_KILL_Y
+}
+
+fn equipped_totem_slot(player: &PlayerData, version: MinecraftVersion) -> Option<usize> {
+    let main_hand_slot = HOTBAR_START_SLOT + player.held_slot.min(8) as usize;
+    [main_hand_slot, PLAYER_INVENTORY_SLOTS - 1]
+        .into_iter()
+        .find(|slot| {
+            player
+                .inventory
+                .get(*slot)
+                .and_then(|stack| inventory_item_id(stack, version))
+                == Some(pumpkin_data::item::Item::TOTEM_OF_UNDYING.id)
+        })
+}
+
+async fn try_pop_totem(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    player: &mut PlayerData,
+    entity_id: i32,
+) -> std::io::Result<bool> {
+    if let Some(slot) = equipped_totem_slot(player, version) {
+        player.inventory[slot].clear();
+        let empty = ItemStackSerializer::from(pumpkin_data::item_stack::ItemStack::EMPTY.clone());
+        let slot_update = CSetContainerSlot::new(0, 0, slot as i16, &empty);
+        let payload = encode_java_packet(&slot_update, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+
+        let animation = pumpkin_protocol::java::client::play::CEntityStatus::new(entity_id, 35);
+        let payload = encode_java_packet(&animation, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub async fn handle_play_packet(
@@ -350,7 +389,7 @@ pub async fn handle_play_packet(
             player.pitch = f32::from_be_bytes(payload[28..32].try_into().unwrap_or_default());
 
             let on_ground = payload[32] != 0;
-            process_fall_damage(stream, player, on_ground, my_entity_id, uuid).await?;
+            process_fall_damage(stream, version, player, on_ground, my_entity_id, uuid).await?;
             moved = true;
         }
     } else if pid == sv_pos {
@@ -360,7 +399,7 @@ pub async fn handle_play_packet(
             player.z = f64::from_be_bytes(payload[16..24].try_into().unwrap_or_default());
 
             let on_ground = payload[24] != 0;
-            process_fall_damage(stream, player, on_ground, my_entity_id, uuid).await?;
+            process_fall_damage(stream, version, player, on_ground, my_entity_id, uuid).await?;
             moved = true;
         }
     } else if pid == pumpkin_data::packet::serverbound::PLAY_MOVE_PLAYER_ROT.to_id(version) {
@@ -468,30 +507,11 @@ pub async fn handle_play_packet(
         }
     }
 
-    if player.y < -64.0 {
-        player.x = 0.0;
-        player.y = 70.0;
-        player.z = 0.0;
-
-        let pos_pkt = CPlayerPosition::new(
-            VarInt(1),
-            Vector3 {
-                x: player.x,
-                y: player.y,
-                z: player.z,
-            },
-            Vector3 {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            },
-            player.yaw,
-            player.pitch,
-            vec![],
-        );
-        let payload = encode_java_packet(&pos_pkt, version)?;
+    if is_void_lethal(player.y) && player.health > 0.0 && !matches!(player.gamemode, 1 | 3) {
+        player.health = 0.0;
+        let health = pumpkin_protocol::java::client::play::CSetHealth::new(0.0, VarInt(20), 20.0);
+        let payload = encode_java_packet(&health, version)?;
         write_framed_payload(stream, payload.as_slice()).await?;
-        moved = true;
     }
 
     if moved {
@@ -606,7 +626,8 @@ async fn handle_command(
 }
 
 async fn process_fall_damage(
-    _stream: &mut TcpStream,
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
     player: &mut PlayerData,
     on_ground: bool,
     my_entity_id: i32,
@@ -614,8 +635,12 @@ async fn process_fall_damage(
 ) -> std::io::Result<()> {
     if on_ground {
         let fall_dist = player.highest_y - player.y;
-        if fall_dist > 3.0 && player.gamemode == 0 {
+        if fall_dist > 3.0 && matches!(player.gamemode, 0 | 2) {
             let damage = (fall_dist - 3.0).ceil() as f32;
+            if try_pop_totem(stream, version, player, my_entity_id).await? {
+                player.highest_y = player.y;
+                return Ok(());
+            }
             let _ = player_event_channel().send(PlayerEvent::Hurt {
                 entity_id: my_entity_id,
                 uuid,
@@ -655,6 +680,39 @@ mod tests {
     fn empty_hand_has_no_placeable_block() {
         let player = PlayerData::default();
         assert_eq!(held_block_state(&player, 0, MinecraftVersion::V_26_1), None);
+    }
+
+    #[test]
+    fn void_only_becomes_lethal_below_the_fall_zone() {
+        assert!(!is_void_lethal(-64.1));
+        assert!(!is_void_lethal(-127.9));
+        assert!(is_void_lethal(-128.0));
+    }
+
+    #[test]
+    fn detects_totems_in_selected_hand_and_offhand() {
+        let version = MinecraftVersion::V_26_1;
+        let serialized = ItemStackSerializer::from(pumpkin_data::item_stack::ItemStack::new(
+            1,
+            &pumpkin_data::item::Item::TOTEM_OF_UNDYING,
+        ));
+        let mut bytes = Vec::new();
+        serialized.write_with_version(&mut bytes, &version).unwrap();
+
+        let mut player = PlayerData::default();
+        player.held_slot = 2;
+        player.inventory[HOTBAR_START_SLOT + 2] = bytes.clone();
+        assert_eq!(
+            equipped_totem_slot(&player, version),
+            Some(HOTBAR_START_SLOT + 2)
+        );
+
+        player.inventory[HOTBAR_START_SLOT + 2].clear();
+        player.inventory[PLAYER_INVENTORY_SLOTS - 1] = bytes;
+        assert_eq!(
+            equipped_totem_slot(&player, version),
+            Some(PLAYER_INVENTORY_SLOTS - 1)
+        );
     }
 
     #[test]
