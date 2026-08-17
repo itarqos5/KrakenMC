@@ -9,7 +9,7 @@ use noise::{NoiseFn, Perlin};
 use pumpkin_util::version::MinecraftVersion;
 use serde::{Deserialize, Serialize};
 
-const CHUNK_FORMAT_VERSION: u8 = 4;
+const CHUNK_FORMAT_VERSION: u8 = 5;
 const SECTION_COUNT: usize = 24;
 const MIN_Y: i32 = -64;
 const MAX_Y: i32 = 319;
@@ -56,6 +56,13 @@ struct BlockPosition {
     x: i32,
     y: i32,
     z: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructureKind {
+    Village,
+    DesertTemple,
+    JungleTemple,
 }
 
 impl TerrainBiome {
@@ -683,6 +690,15 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
         &temperature_noise,
         &moisture_noise,
     );
+    add_contextual_structures(
+        &mut chunk,
+        chunk_x,
+        chunk_z,
+        seed,
+        &terrain_noise,
+        &temperature_noise,
+        &moisture_noise,
+    );
     chunk
 }
 
@@ -844,6 +860,394 @@ fn place_tree(
             }
         }
     }
+}
+
+fn structure_for_biome(biome: TerrainBiome, hash: u64) -> Option<StructureKind> {
+    match biome {
+        TerrainBiome::Desert if hash.is_multiple_of(2) => Some(StructureKind::DesertTemple),
+        TerrainBiome::Desert
+        | TerrainBiome::SnowyPlains
+        | TerrainBiome::Taiga
+        | TerrainBiome::Plains
+        | TerrainBiome::Savanna => Some(StructureKind::Village),
+        TerrainBiome::Jungle => Some(StructureKind::JungleTemple),
+        TerrainBiome::Ocean | TerrainBiome::Forest => None,
+    }
+}
+
+fn add_contextual_structures(
+    chunk: &mut SavedChunk,
+    chunk_x: i32,
+    chunk_z: i32,
+    seed: i64,
+    terrain_noise: &Perlin,
+    temperature_noise: &Perlin,
+    moisture_noise: &Perlin,
+) {
+    const REGION_SIZE: i32 = 24;
+    let target_region_x = chunk_x.div_euclid(REGION_SIZE);
+    let target_region_z = chunk_z.div_euclid(REGION_SIZE);
+    for region_z in target_region_z - 1..=target_region_z + 1 {
+        for region_x in target_region_x - 1..=target_region_x + 1 {
+            let hash = coordinate_hash(seed ^ 0x5354_5255_4354, region_x, 0, region_z);
+            if !hash.is_multiple_of(3) {
+                continue;
+            }
+            let source_chunk_x = region_x * REGION_SIZE + ((hash >> 8) % REGION_SIZE as u64) as i32;
+            let source_chunk_z =
+                region_z * REGION_SIZE + ((hash >> 20) % REGION_SIZE as u64) as i32;
+            let world_x = source_chunk_x * 16 + 8;
+            let world_z = source_chunk_z * 16 + 8;
+            let (biome, _) = climate_at(world_x, world_z, temperature_noise, moisture_noise);
+            let Some(kind) = structure_for_biome(biome, hash >> 32) else {
+                continue;
+            };
+            let surface = surface_height_at(world_x, world_z, biome, terrain_noise).clamp(34, 180);
+            if surface < 63 {
+                continue;
+            }
+            let target = ChunkPosition {
+                x: chunk_x,
+                z: chunk_z,
+            };
+            let center = BlockPosition {
+                x: world_x,
+                y: surface,
+                z: world_z,
+            };
+            match kind {
+                StructureKind::Village => place_village(chunk, target, center, biome),
+                StructureKind::DesertTemple => place_desert_temple(chunk, target, center),
+                StructureKind::JungleTemple => place_jungle_temple(chunk, target, center),
+            }
+        }
+    }
+}
+
+fn set_structure_block(
+    chunk: &mut SavedChunk,
+    target_chunk: ChunkPosition,
+    position: BlockPosition,
+    state: u16,
+) {
+    if position.x >> 4 != target_chunk.x || position.z >> 4 != target_chunk.z {
+        return;
+    }
+    let Some(index) = block_index(
+        (position.x & 15) as usize,
+        position.y,
+        (position.z & 15) as usize,
+    ) else {
+        return;
+    };
+    chunk.blocks[index] = state;
+}
+
+fn fill_structure_box(
+    chunk: &mut SavedChunk,
+    target_chunk: ChunkPosition,
+    from: BlockPosition,
+    to: BlockPosition,
+    state: u16,
+) {
+    for y in from.y..=to.y {
+        for z in from.z..=to.z {
+            for x in from.x..=to.x {
+                set_structure_block(chunk, target_chunk, BlockPosition { x, y, z }, state);
+            }
+        }
+    }
+}
+
+fn place_desert_temple(chunk: &mut SavedChunk, target_chunk: ChunkPosition, center: BlockPosition) {
+    let sandstone = pumpkin_data::Block::SANDSTONE.default_state.id;
+    let cut = pumpkin_data::Block::CUT_SANDSTONE.default_state.id;
+    let chiseled = pumpkin_data::Block::CHISELED_SANDSTONE.default_state.id;
+    let orange = pumpkin_data::Block::ORANGE_TERRACOTTA.default_state.id;
+    let blue = pumpkin_data::Block::BLUE_TERRACOTTA.default_state.id;
+    let air = pumpkin_data::Block::AIR.default_state.id;
+
+    fill_structure_box(
+        chunk,
+        target_chunk,
+        BlockPosition {
+            x: center.x - 7,
+            y: center.y - 2,
+            z: center.z - 7,
+        },
+        BlockPosition {
+            x: center.x + 7,
+            y: center.y,
+            z: center.z + 7,
+        },
+        sandstone,
+    );
+    for level in 1..=5 {
+        let radius = 7 - level;
+        for z in center.z - radius..=center.z + radius {
+            for x in center.x - radius..=center.x + radius {
+                if x.abs_diff(center.x) as i32 == radius || z.abs_diff(center.z) as i32 == radius {
+                    set_structure_block(
+                        chunk,
+                        target_chunk,
+                        BlockPosition {
+                            x,
+                            y: center.y + level,
+                            z,
+                        },
+                        cut,
+                    );
+                }
+            }
+        }
+    }
+    fill_structure_box(
+        chunk,
+        target_chunk,
+        BlockPosition {
+            x: center.x - 4,
+            y: center.y + 1,
+            z: center.z - 4,
+        },
+        BlockPosition {
+            x: center.x + 4,
+            y: center.y + 4,
+            z: center.z + 4,
+        },
+        air,
+    );
+    for offset in -2..=2 {
+        set_structure_block(
+            chunk,
+            target_chunk,
+            BlockPosition {
+                x: center.x + offset,
+                y: center.y,
+                z: center.z,
+            },
+            orange,
+        );
+        set_structure_block(
+            chunk,
+            target_chunk,
+            BlockPosition {
+                x: center.x,
+                y: center.y,
+                z: center.z + offset,
+            },
+            orange,
+        );
+    }
+    set_structure_block(chunk, target_chunk, center, blue);
+    for (dx, dz) in [(-5, -5), (-5, 5), (5, -5), (5, 5)] {
+        fill_structure_box(
+            chunk,
+            target_chunk,
+            BlockPosition {
+                x: center.x + dx,
+                y: center.y + 1,
+                z: center.z + dz,
+            },
+            BlockPosition {
+                x: center.x + dx,
+                y: center.y + 7,
+                z: center.z + dz,
+            },
+            chiseled,
+        );
+    }
+}
+
+fn village_palette(biome: TerrainBiome) -> (u16, u16) {
+    match biome {
+        TerrainBiome::Desert => (
+            pumpkin_data::Block::SANDSTONE.default_state.id,
+            pumpkin_data::Block::CUT_SANDSTONE.default_state.id,
+        ),
+        TerrainBiome::Taiga | TerrainBiome::SnowyPlains => (
+            pumpkin_data::Block::SPRUCE_LOG.default_state.id,
+            pumpkin_data::Block::SPRUCE_PLANKS.default_state.id,
+        ),
+        TerrainBiome::Savanna => (
+            pumpkin_data::Block::ACACIA_LOG.default_state.id,
+            pumpkin_data::Block::ACACIA_PLANKS.default_state.id,
+        ),
+        _ => (
+            pumpkin_data::Block::OAK_LOG.default_state.id,
+            pumpkin_data::Block::OAK_PLANKS.default_state.id,
+        ),
+    }
+}
+
+fn place_village(
+    chunk: &mut SavedChunk,
+    target_chunk: ChunkPosition,
+    center: BlockPosition,
+    biome: TerrainBiome,
+) {
+    let road = pumpkin_data::Block::DIRT_PATH.default_state.id;
+    let cobblestone = pumpkin_data::Block::COBBLESTONE.default_state.id;
+    let water = pumpkin_data::Block::WATER.default_state.id;
+    let (frame, wall) = village_palette(biome);
+
+    for offset in -18..=18 {
+        for width in -1..=1 {
+            for (x, z) in [
+                (center.x + offset, center.z + width),
+                (center.x + width, center.z + offset),
+            ] {
+                set_structure_block(
+                    chunk,
+                    target_chunk,
+                    BlockPosition { x, y: center.y, z },
+                    road,
+                );
+            }
+        }
+    }
+    fill_structure_box(
+        chunk,
+        target_chunk,
+        BlockPosition {
+            x: center.x - 2,
+            y: center.y,
+            z: center.z - 2,
+        },
+        BlockPosition {
+            x: center.x + 2,
+            y: center.y + 1,
+            z: center.z + 2,
+        },
+        cobblestone,
+    );
+    set_structure_block(
+        chunk,
+        target_chunk,
+        BlockPosition {
+            y: center.y + 1,
+            ..center
+        },
+        water,
+    );
+    for (dx, dz) in [(-10, -10), (10, -10), (-10, 10), (10, 10)] {
+        place_village_house(
+            chunk,
+            target_chunk,
+            BlockPosition {
+                x: center.x + dx,
+                y: center.y,
+                z: center.z + dz,
+            },
+            frame,
+            wall,
+        );
+    }
+}
+
+fn place_village_house(
+    chunk: &mut SavedChunk,
+    target_chunk: ChunkPosition,
+    center: BlockPosition,
+    frame: u16,
+    wall: u16,
+) {
+    let air = pumpkin_data::Block::AIR.default_state.id;
+    fill_structure_box(
+        chunk,
+        target_chunk,
+        BlockPosition {
+            x: center.x - 3,
+            y: center.y - 2,
+            z: center.z - 3,
+        },
+        BlockPosition {
+            x: center.x + 3,
+            y: center.y,
+            z: center.z + 3,
+        },
+        frame,
+    );
+    for y in center.y + 1..=center.y + 3 {
+        for z in center.z - 3..=center.z + 3 {
+            for x in center.x - 3..=center.x + 3 {
+                let boundary = x == center.x - 3
+                    || x == center.x + 3
+                    || z == center.z - 3
+                    || z == center.z + 3;
+                let corner = (x == center.x - 3 || x == center.x + 3)
+                    && (z == center.z - 3 || z == center.z + 3);
+                let doorway = z == center.z - 3 && x == center.x && y <= center.y + 2;
+                set_structure_block(
+                    chunk,
+                    target_chunk,
+                    BlockPosition { x, y, z },
+                    if doorway {
+                        air
+                    } else if corner {
+                        frame
+                    } else if boundary {
+                        wall
+                    } else {
+                        air
+                    },
+                );
+            }
+        }
+    }
+    fill_structure_box(
+        chunk,
+        target_chunk,
+        BlockPosition {
+            x: center.x - 4,
+            y: center.y + 4,
+            z: center.z - 4,
+        },
+        BlockPosition {
+            x: center.x + 4,
+            y: center.y + 4,
+            z: center.z + 4,
+        },
+        wall,
+    );
+}
+
+fn place_jungle_temple(chunk: &mut SavedChunk, target_chunk: ChunkPosition, center: BlockPosition) {
+    let mossy = pumpkin_data::Block::MOSSY_COBBLESTONE.default_state.id;
+    let cobblestone = pumpkin_data::Block::COBBLESTONE.default_state.id;
+    let air = pumpkin_data::Block::AIR.default_state.id;
+    for level in 0..=4 {
+        let radius = 6 - level;
+        fill_structure_box(
+            chunk,
+            target_chunk,
+            BlockPosition {
+                x: center.x - radius,
+                y: center.y + level,
+                z: center.z - radius,
+            },
+            BlockPosition {
+                x: center.x + radius,
+                y: center.y + level,
+                z: center.z + radius,
+            },
+            if level % 2 == 0 { mossy } else { cobblestone },
+        );
+    }
+    fill_structure_box(
+        chunk,
+        target_chunk,
+        BlockPosition {
+            x: center.x - 3,
+            y: center.y + 1,
+            z: center.z - 3,
+        },
+        BlockPosition {
+            x: center.x + 3,
+            y: center.y + 3,
+            z: center.z + 3,
+        },
+        air,
+    );
 }
 
 pub fn encode_chunk_packet(
@@ -1107,6 +1511,45 @@ mod tests {
         }
 
         assert_eq!(found, [true; 4]);
+    }
+
+    #[test]
+    fn structures_are_biome_specific() {
+        assert_eq!(
+            structure_for_biome(TerrainBiome::Desert, 2),
+            Some(StructureKind::DesertTemple)
+        );
+        assert_eq!(
+            structure_for_biome(TerrainBiome::Plains, 1),
+            Some(StructureKind::Village)
+        );
+        assert_eq!(
+            structure_for_biome(TerrainBiome::Jungle, 1),
+            Some(StructureKind::JungleTemple)
+        );
+        assert_eq!(structure_for_biome(TerrainBiome::Ocean, 1), None);
+    }
+
+    #[test]
+    fn large_structures_continue_across_chunk_edges() {
+        let air = pumpkin_data::Block::AIR.default_state.id;
+        let empty_chunk = || SavedChunk {
+            format_version: CHUNK_FORMAT_VERSION,
+            blocks: vec![air; BLOCKS_PER_CHUNK],
+            biomes: vec![TerrainBiome::Desert.protocol_id(); 256],
+            temperatures: vec![1200; 256],
+            surface_y: vec![70; 256],
+        };
+        let center = BlockPosition { x: 15, y: 70, z: 8 };
+        let mut left = empty_chunk();
+        let mut right = empty_chunk();
+
+        place_desert_temple(&mut left, ChunkPosition { x: 0, z: 0 }, center);
+        place_desert_temple(&mut right, ChunkPosition { x: 1, z: 0 }, center);
+
+        let sandstone = pumpkin_data::Block::SANDSTONE.default_state.id;
+        assert!(left.blocks.contains(&sandstone));
+        assert!(right.blocks.contains(&sandstone));
     }
 
     #[test]
