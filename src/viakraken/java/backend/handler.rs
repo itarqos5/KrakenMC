@@ -21,7 +21,7 @@ use crate::viakraken::utils::{read_varint_from_slice, write_framed_payload, writ
 use crate::world::chunk_gen::{get_block_state, save_block_change};
 use crate::world::player_store::PlayerData;
 
-use super::play::{send_command_tree, send_permission_status};
+use super::play::{send_command_tree, send_permission_status, store_inventory_item};
 use super::state::{
     block_channel, chat_channel, console_command_channel, gamemode_abilities, online_players,
     player_event_channel, register_summoned_entity, BlockUpdateEvent, ConsoleCommand, PlayerEvent,
@@ -982,6 +982,46 @@ async fn handle_command(
                     "Unknown gamemode. Use: survival, creative, adventure, spectator",
                 )
                 .await?;
+            }
+        } else if parts[0] == "give" && matches!(parts.len(), 2 | 3) {
+            if player.operator_level == 0 {
+                send_system_message(
+                    stream,
+                    version,
+                    "You do not have permission to use this command.",
+                )
+                .await?;
+                return Ok(());
+            }
+            let item_name = parts[1].strip_prefix("minecraft:").unwrap_or(parts[1]);
+            let Some(item) = pumpkin_data::item::Item::from_registry_key(item_name) else {
+                send_system_message(stream, version, "Unknown item.").await?;
+                return Ok(());
+            };
+            let requested_count = parts
+                .get(2)
+                .and_then(|count| count.parse::<u8>().ok())
+                .unwrap_or(1);
+            let max_count = pumpkin_data::item_stack::ItemStack::new(1, item).get_max_stack_size();
+            if requested_count == 0 || requested_count > max_count {
+                send_system_message(
+                    stream,
+                    version,
+                    &format!("Count must be between 1 and {max_count}."),
+                )
+                .await?;
+                return Ok(());
+            }
+            if store_inventory_item(stream, version, player, item.id, requested_count).await? {
+                send_system_message(
+                    stream,
+                    version,
+                    &format!("Gave {requested_count} {}.", item.registry_key),
+                )
+                .await?;
+                log_info!("{}: /{}", username, cmd);
+            } else {
+                send_system_message(stream, version, "Your inventory is full.").await?;
             }
         } else if parts[0] == "summon" && matches!(parts.len(), 2 | 5) {
             if player.operator_level == 0 {

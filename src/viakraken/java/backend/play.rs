@@ -71,7 +71,7 @@ fn drop_destination_slot(
         .next()
 }
 
-async fn store_dropped_item(
+pub(super) async fn store_inventory_item(
     stream: &mut TcpStream,
     version: MinecraftVersion,
     player: &mut PlayerData,
@@ -308,7 +308,7 @@ pub(super) async fn send_command_tree(
     is_operator: bool,
 ) -> std::io::Result<()> {
     let root_children = if is_operator {
-        vec![VarInt(1), VarInt(2)]
+        vec![VarInt(1), VarInt(2), VarInt(9)]
     } else {
         Vec::new()
     };
@@ -390,6 +390,40 @@ pub(super) async fn send_command_tree(
                 name: "spectator",
                 is_executable: true,
                 redirect_target: None,
+                restricted: false,
+            },
+        },
+        ProtoNode {
+            children: vec![VarInt(10)].into_boxed_slice(),
+            node_type: ProtoNodeType::Literal {
+                name: "give",
+                is_executable: false,
+                redirect_target: None,
+                restricted: true,
+            },
+        },
+        ProtoNode {
+            children: vec![VarInt(11)].into_boxed_slice(),
+            node_type: ProtoNodeType::Argument {
+                name: "item",
+                is_executable: true,
+                redirect_target: None,
+                parser: ArgumentType::ItemStack,
+                override_suggestion_type: None,
+                restricted: false,
+            },
+        },
+        ProtoNode {
+            children: vec![].into_boxed_slice(),
+            node_type: ProtoNodeType::Argument {
+                name: "count",
+                is_executable: true,
+                redirect_target: None,
+                parser: ArgumentType::Integer {
+                    min: Some(1),
+                    max: Some(64),
+                },
+                override_suggestion_type: None,
                 restricted: false,
             },
         },
@@ -790,6 +824,13 @@ pub async fn handle_play(
                         change_gamemode(stream, version, &mut player, uuid, gamemode).await?;
                         log_info!("Set {} to game mode {} from the console.", username, gamemode);
                     }
+                    ConsoleCommand::Give { uuid: target, item_id, count } if target == uuid => {
+                        if store_inventory_item(stream, version, &mut player, item_id, count).await? {
+                            log_info!("Gave {} item {} x{} from the console.", username, item_id, count);
+                        } else {
+                            log_warn!("Could not give an item to {}; their inventory is full.", username);
+                        }
+                    }
                     ConsoleCommand::Summon { entity_id, entity_type, x, y, z } => {
                         let entity = summoned_entities()
                             .lock()
@@ -1075,7 +1116,7 @@ pub async fn handle_play(
             }
             _ = pickup_interval.tick(), if player.gamemode != 3 => {
                 if let Some(item) = claim_nearby_dropped_item(player.x, player.y + 0.5, player.z) {
-                    if store_dropped_item(stream, version, &mut player, item.item_id, item.count).await? {
+                    if store_inventory_item(stream, version, &mut player, item.item_id, item.count).await? {
                         let _ = item_event_channel().send(
                             crate::viakraken::java::backend::state::ItemEvent::Pickup {
                                 item_entity_id: item.entity_id,

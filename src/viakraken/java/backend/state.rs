@@ -162,6 +162,11 @@ pub enum ConsoleCommand {
         uuid: Uuid,
         gamemode: u8,
     },
+    Give {
+        uuid: Uuid,
+        item_id: u16,
+        count: u8,
+    },
     Summon {
         entity_id: i32,
         entity_type: u16,

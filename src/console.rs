@@ -83,6 +83,27 @@ fn execute(input: &str) {
             };
             send_to_player(parts[2], |uuid| ConsoleCommand::Gamemode { uuid, gamemode });
         }
+        "give" if parts.len() == 3 || parts.len() == 4 => {
+            let item_name = parts[2].strip_prefix("minecraft:").unwrap_or(parts[2]);
+            let Some(item) = pumpkin_data::item::Item::from_registry_key(item_name) else {
+                log_warn!("Unknown item '{}'.", parts[2]);
+                return;
+            };
+            let count = parts
+                .get(3)
+                .and_then(|count| count.parse::<u8>().ok())
+                .unwrap_or(1);
+            let max_count = pumpkin_data::item_stack::ItemStack::new(1, item).get_max_stack_size();
+            if count == 0 || count > max_count {
+                log_warn!("Count must be between 1 and {}.", max_count);
+                return;
+            }
+            send_to_player(parts[1], |uuid| ConsoleCommand::Give {
+                uuid,
+                item_id: item.id,
+                count,
+            });
+        }
         "summon" if parts.len() == 2 || parts.len() == 5 => {
             let entity_name = parts[1].strip_prefix("minecraft:").unwrap_or(parts[1]);
             let Some(entity_type) = pumpkin_data::entity::EntityType::from_name(entity_name) else {
@@ -190,6 +211,7 @@ fn print_help() {
     log_info!("  /deop <player>                Remove operator status");
     log_info!("  /kill <player>                Kill an online player");
     log_info!("  /gamemode <mode> <player>     Set survival/creative/adventure/spectator");
+    log_info!("  /give <player> <item> [count] Give an item to an online player");
     log_info!("  /summon <entity> [x y z]      Summon an entity (default: 0 0 0)");
 }
 
