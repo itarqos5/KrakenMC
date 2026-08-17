@@ -33,14 +33,42 @@ use super::handler::{change_gamemode, handle_play_packet};
 use super::state::{
     block_channel, chat_channel, claim_nearby_dropped_item, console_command_channel,
     gamemode_abilities, item_event_channel, online_players, player_event_channel,
-    spawn_dropped_item, summoned_entities, summoned_entity_channel, ConsoleCommand, OnlinePlayer,
-    PlayerEvent, SummonedEntity, SummonedEntityEvent, NEXT_ENTITY_ID,
+    restore_dropped_item, spawn_dropped_item, summoned_entities, summoned_entity_channel,
+    ConsoleCommand, OnlinePlayer, PlayerEvent, SummonedEntity, SummonedEntityEvent, NEXT_ENTITY_ID,
 };
 
-fn has_empty_drop_slot(player: &PlayerData) -> bool {
-    (36..45)
-        .chain(9..36)
-        .any(|slot| player.inventory.get(slot).is_some_and(Vec::is_empty))
+fn inventory_stack_summary(slot: &[u8], version: MinecraftVersion) -> Option<(u16, u8)> {
+    let mut offset = 0;
+    let count = u8::try_from(read_varint_from_slice(slot, &mut offset).ok()?).ok()?;
+    if count == 0 {
+        return None;
+    }
+    let network_item_id = u16::try_from(read_varint_from_slice(slot, &mut offset).ok()?).ok()?;
+    let item_id = pumpkin_data::item_id_remap::remap_item_id_from_version(network_item_id, version);
+    Some((item_id, count))
+}
+
+fn drop_destination_slot(
+    player: &PlayerData,
+    version: MinecraftVersion,
+    item_id: u16,
+    incoming_count: u8,
+) -> Option<(usize, u8)> {
+    let item = pumpkin_data::item::Item::from_id(item_id)?;
+    let max_stack = pumpkin_data::item_stack::ItemStack::new(1, item).get_max_stack_size();
+    let inventory_order = (36..45).chain(9..36);
+    if let Some((slot, count)) = inventory_order.clone().find_map(|slot| {
+        let (existing_id, existing_count) =
+            inventory_stack_summary(player.inventory.get(slot)?, version)?;
+        (existing_id == item_id && existing_count.saturating_add(incoming_count) <= max_stack)
+            .then_some((slot, existing_count))
+    }) {
+        return Some((slot, count + incoming_count));
+    }
+    inventory_order
+        .filter(|slot| player.inventory.get(*slot).is_some_and(Vec::is_empty))
+        .map(|slot| (slot, incoming_count))
+        .next()
 }
 
 async fn store_dropped_item(
@@ -56,13 +84,10 @@ async fn store_dropped_item(
     let Some(item) = pumpkin_data::item::Item::from_id(item_id) else {
         return Ok(false);
     };
-    let Some(slot) = (36..45)
-        .chain(9..36)
-        .find(|slot| player.inventory.get(*slot).is_some_and(Vec::is_empty))
-    else {
+    let Some((slot, new_count)) = drop_destination_slot(player, version, item_id, count) else {
         return Ok(false);
     };
-    let serialized = ItemStackSerializer::from(ItemStack::new(count, item));
+    let serialized = ItemStackSerializer::from(ItemStack::new(new_count, item));
     let mut bytes = Vec::new();
     serialized
         .write_with_version(&mut bytes, &version)
@@ -72,6 +97,59 @@ async fn store_dropped_item(
     let payload = encode_java_packet(&packet, version)?;
     write_framed_payload(stream, payload.as_slice()).await?;
     Ok(true)
+}
+
+async fn send_dropped_item_spawn(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    entity_id: i32,
+    item_id: u16,
+    count: u8,
+    position: Vector3<f64>,
+    velocity: Vector3<f64>,
+) -> std::io::Result<()> {
+    use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
+    use pumpkin_protocol::java::client::play::{CEntityVelocity, CSetEntityMetadata};
+
+    let network_entity_type = pumpkin_data::entity_id_remap::remap_entity_id_for_version(
+        pumpkin_data::entity::EntityType::ITEM.id,
+        version,
+    );
+    let spawn = CSpawnEntity::new(
+        VarInt(entity_id),
+        Uuid::new_v4(),
+        VarInt(network_entity_type as i32),
+        position,
+        0.0,
+        0.0,
+        0.0,
+        VarInt(0),
+        Vector3::new(0.0, 0.0, 0.0),
+    );
+    let payload = encode_java_packet(&spawn, version)?;
+    write_framed_payload(stream, payload.as_slice()).await?;
+
+    if let Some(item) = pumpkin_data::item::Item::from_id(item_id) {
+        let serialized =
+            ItemStackSerializer::from(pumpkin_data::item_stack::ItemStack::new(count, item));
+        let mut metadata = vec![8]; // ItemEntity stack tracker index in supported Java protocols.
+        metadata
+            .write_var_int(&VarInt(
+                pumpkin_data::meta_data_type::MetaDataType::ITEM_STACK.id(version),
+            ))
+            .map_err(|error| Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+        serialized
+            .write_with_version(&mut metadata, &version)
+            .map_err(|error| Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+        metadata.push(0xff);
+        let packet = CSetEntityMetadata::new(VarInt(entity_id), metadata.into_boxed_slice());
+        let payload = encode_java_packet(&packet, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+    }
+
+    let packet = CEntityVelocity::new(VarInt(entity_id), velocity);
+    let payload = encode_java_packet(&packet, version)?;
+    write_framed_payload(stream, payload.as_slice()).await
 }
 
 fn world_time_ticks() -> i64 {
@@ -884,58 +962,15 @@ pub async fn handle_play(
             Ok(item_event) = item_rx.recv() => {
                 match item_event {
                     crate::viakraken::java::backend::state::ItemEvent::Spawn { entity_id, item_id, count, x, y, z, vx, vy, vz } => {
-                        let network_entity_type = pumpkin_data::entity_id_remap::remap_entity_id_for_version(
-                            pumpkin_data::entity::EntityType::ITEM.id,
+                        send_dropped_item_spawn(
+                            stream,
                             version,
-                        );
-                        let spawn_pkt = CSpawnEntity::new(
-                            VarInt(entity_id),
-                            Uuid::new_v4(),
-                            VarInt(network_entity_type as i32),
-                            Vector3 { x, y, z },
-                            0.0,
-                            0.0,
-                            0.0,
-                            VarInt(0),
-                            Vector3 { x: 0.0, y: 0.0, z: 0.0 },
-                        );
-                        if let Ok(payload) = encode_java_packet(&spawn_pkt, version) {
-                            let _ = write_framed_payload(stream, payload.as_slice()).await;
-                        }
-
-                        if let Some(item) = pumpkin_data::item::Item::from_id(item_id) {
-                            use pumpkin_data::{meta_data_type::MetaDataType, tracked_data::TrackedData};
-                            use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
-                            use pumpkin_protocol::java::client::play::{CSetEntityMetadata, Metadata};
-
-                            let stack = pumpkin_data::item_stack::ItemStack::new(count, item);
-                            let serialized = ItemStackSerializer::from(stack);
-                            let metadata = Metadata::new(
-                                TrackedData::ITEM,
-                                MetaDataType::ITEM_STACK,
-                                &serialized,
-                            );
-                            let mut metadata_bytes = Vec::new();
-                            if metadata.write(&mut metadata_bytes, &version).is_ok() {
-                                metadata_bytes.push(0xff);
-                                let packet = CSetEntityMetadata::new(
-                                    VarInt(entity_id),
-                                    metadata_bytes.into_boxed_slice(),
-                                );
-                                if let Ok(payload) = encode_java_packet(&packet, version) {
-                                    let _ = write_framed_payload(stream, payload.as_slice()).await;
-                                }
-                            }
-                        }
-
-                        use pumpkin_protocol::java::client::play::CEntityVelocity;
-                        let vel = CEntityVelocity::new(
-                            VarInt(entity_id),
+                            entity_id,
+                            item_id,
+                            count,
+                            Vector3::new(x, y, z),
                             Vector3::new(vx, vy, vz),
-                        );
-                        if let Ok(payload) = encode_java_packet(&vel, version) {
-                            let _ = write_framed_payload(stream, payload.as_slice()).await;
-                        }
+                        ).await?;
                     }
                     crate::viakraken::java::backend::state::ItemEvent::Pickup { item_entity_id, player_entity_id, count } => {
                         let packet = CTakeItemEntity::new(
@@ -1019,7 +1054,7 @@ pub async fn handle_play(
             _ = entity_interval.tick() => {
                 tick_summoned_zombies(&db);
             }
-            _ = pickup_interval.tick(), if player.gamemode != 3 && has_empty_drop_slot(&player) => {
+            _ = pickup_interval.tick(), if player.gamemode != 3 => {
                 if let Some(item) = claim_nearby_dropped_item(player.x, player.y + 0.5, player.z) {
                     if store_dropped_item(stream, version, &mut player, item.item_id, item.count).await? {
                         let _ = item_event_channel().send(
@@ -1029,6 +1064,8 @@ pub async fn handle_play(
                                 count: item.count,
                             },
                         );
+                    } else {
+                        restore_dropped_item(item);
                     }
                 }
             }
@@ -1160,6 +1197,33 @@ mod tests {
     #[test]
     fn client_view_distance_controls_streaming_radius() {
         assert_eq!(chunks_in_view(0, 0, 12).len(), 625);
+    }
+
+    #[test]
+    fn pickups_merge_before_using_the_first_empty_hotbar_slot() {
+        use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
+
+        let version = MinecraftVersion::V_26_1;
+        let mut player = PlayerData::default();
+        for slot in 36..40 {
+            player.inventory[slot] = vec![1];
+        }
+        assert_eq!(
+            drop_destination_slot(&player, version, pumpkin_data::item::Item::STONE.id, 1),
+            Some((40, 1))
+        );
+
+        let stack = ItemStackSerializer::from(pumpkin_data::item_stack::ItemStack::new(
+            12,
+            &pumpkin_data::item::Item::STONE,
+        ));
+        let mut bytes = Vec::new();
+        stack.write_with_version(&mut bytes, &version).unwrap();
+        player.inventory[37] = bytes;
+        assert_eq!(
+            drop_destination_slot(&player, version, pumpkin_data::item::Item::STONE.id, 1),
+            Some((37, 13))
+        );
     }
 
     #[test]

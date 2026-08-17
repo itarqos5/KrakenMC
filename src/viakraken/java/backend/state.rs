@@ -285,3 +285,9 @@ pub fn claim_nearby_dropped_item(x: f64, y: f64, z: f64) -> Option<DroppedItem> 
         .map(|(entity_id, _)| entity_id)?;
     items.remove(&entity_id)
 }
+
+pub fn restore_dropped_item(item: DroppedItem) {
+    if let Ok(mut items) = dropped_items().lock() {
+        items.insert(item.entity_id, item);
+    }
+}
