@@ -9,7 +9,7 @@ use noise::{NoiseFn, Perlin};
 use pumpkin_util::version::MinecraftVersion;
 use serde::{Deserialize, Serialize};
 
-const CHUNK_FORMAT_VERSION: u8 = 5;
+const CHUNK_FORMAT_VERSION: u8 = 6;
 const SECTION_COUNT: usize = 24;
 const MIN_Y: i32 = -64;
 const MAX_Y: i32 = 319;
@@ -392,6 +392,7 @@ struct OreVein {
     min_y: i32,
     max_y: i32,
     radius: i32,
+    air_exposure_keep_one_in: u64,
     stone_ore: u16,
     deepslate_ore: u16,
 }
@@ -404,6 +405,7 @@ fn add_contextual_ore_veins(chunk: &mut SavedChunk, chunk_x: i32, chunk_z: i32, 
             min_y: 0,
             max_y: 128,
             radius: 1,
+            air_exposure_keep_one_in: 2,
             stone_ore: pumpkin_data::Block::COAL_ORE.default_state.id,
             deepslate_ore: pumpkin_data::Block::DEEPSLATE_COAL_ORE.default_state.id,
         },
@@ -413,15 +415,17 @@ fn add_contextual_ore_veins(chunk: &mut SavedChunk, chunk_x: i32, chunk_z: i32, 
             min_y: 0,
             max_y: 96,
             radius: 2,
+            air_exposure_keep_one_in: 2,
             stone_ore: pumpkin_data::Block::COPPER_ORE.default_state.id,
             deepslate_ore: pumpkin_data::Block::DEEPSLATE_COPPER_ORE.default_state.id,
         },
         OreVein {
             salt: 0x4952_4f4e,
-            attempts: 4,
+            attempts: 5,
             min_y: -56,
             max_y: 72,
-            radius: 1,
+            radius: 2,
+            air_exposure_keep_one_in: 3,
             stone_ore: pumpkin_data::Block::IRON_ORE.default_state.id,
             deepslate_ore: pumpkin_data::Block::DEEPSLATE_IRON_ORE.default_state.id,
         },
@@ -431,6 +435,7 @@ fn add_contextual_ore_veins(chunk: &mut SavedChunk, chunk_x: i32, chunk_z: i32, 
             min_y: -56,
             max_y: 32,
             radius: 1,
+            air_exposure_keep_one_in: 2,
             stone_ore: pumpkin_data::Block::GOLD_ORE.default_state.id,
             deepslate_ore: pumpkin_data::Block::DEEPSLATE_GOLD_ORE.default_state.id,
         },
@@ -440,6 +445,7 @@ fn add_contextual_ore_veins(chunk: &mut SavedChunk, chunk_x: i32, chunk_z: i32, 
             min_y: -32,
             max_y: 32,
             radius: 1,
+            air_exposure_keep_one_in: 2,
             stone_ore: pumpkin_data::Block::LAPIS_ORE.default_state.id,
             deepslate_ore: pumpkin_data::Block::DEEPSLATE_LAPIS_ORE.default_state.id,
         },
@@ -449,15 +455,17 @@ fn add_contextual_ore_veins(chunk: &mut SavedChunk, chunk_x: i32, chunk_z: i32, 
             min_y: -60,
             max_y: 16,
             radius: 1,
+            air_exposure_keep_one_in: 2,
             stone_ore: pumpkin_data::Block::REDSTONE_ORE.default_state.id,
             deepslate_ore: pumpkin_data::Block::DEEPSLATE_REDSTONE_ORE.default_state.id,
         },
         OreVein {
             salt: 0x4449_414d,
-            attempts: 2,
+            attempts: 3,
             min_y: -60,
             max_y: 12,
             radius: 1,
+            air_exposure_keep_one_in: 4,
             stone_ore: pumpkin_data::Block::DIAMOND_ORE.default_state.id,
             deepslate_ore: pumpkin_data::Block::DEEPSLATE_DIAMOND_ORE.default_state.id,
         },
@@ -531,9 +539,20 @@ fn place_ore_blob(
                     continue;
                 };
                 let base = chunk.blocks[index];
+                let placement_hash =
+                    coordinate_hash(hash as i64, position.x, position.y, position.z);
+                let exposed_to_air = ore_position_is_exposed_to_air(
+                    chunk,
+                    (position.x & 15) as usize,
+                    position.y,
+                    (position.z & 15) as usize,
+                );
                 if (base == stone || base == deepslate)
-                    && !coordinate_hash(hash as i64, position.x, position.y, position.z)
-                        .is_multiple_of(5)
+                    && ore_placement_allowed(
+                        placement_hash,
+                        exposed_to_air,
+                        vein.air_exposure_keep_one_in,
+                    )
                 {
                     chunk.blocks[index] = if base == deepslate {
                         vein.deepslate_ore
@@ -546,6 +565,38 @@ fn place_ore_blob(
     }
 }
 
+fn ore_placement_allowed(hash: u64, exposed_to_air: bool, exposure_keep_one_in: u64) -> bool {
+    !hash.is_multiple_of(5) && (!exposed_to_air || hash.is_multiple_of(exposure_keep_one_in))
+}
+
+fn ore_position_is_exposed_to_air(
+    chunk: &SavedChunk,
+    local_x: usize,
+    y: i32,
+    local_z: usize,
+) -> bool {
+    let air = pumpkin_data::Block::AIR.default_state.id;
+    [
+        (local_x.checked_sub(1), Some(y), Some(local_z)),
+        (
+            local_x.checked_add(1).filter(|x| *x < 16),
+            Some(y),
+            Some(local_z),
+        ),
+        (Some(local_x), y.checked_sub(1), Some(local_z)),
+        (Some(local_x), y.checked_add(1), Some(local_z)),
+        (Some(local_x), Some(y), local_z.checked_sub(1)),
+        (
+            Some(local_x),
+            Some(y),
+            local_z.checked_add(1).filter(|z| *z < 16),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(x, y, z)| block_index(x?, y?, z?))
+    .any(|index| chunk.blocks[index] == air)
+}
+
 fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
     let terrain_noise = Perlin::new(seed as u32);
     let temperature_noise = Perlin::new((seed as u32).wrapping_add(0x51f2));
@@ -553,6 +604,7 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
     let cave_noise = Perlin::new((seed as u32).wrapping_add(0x37c1));
     let tunnel_noise = Perlin::new((seed as u32).wrapping_add(0x8d21));
     let noodle_noise = Perlin::new((seed as u32).wrapping_add(0x6b43));
+    let aquifer_noise = Perlin::new((seed as u32).wrapping_add(0xd431));
 
     let air = pumpkin_data::Block::AIR.default_state.id;
     let bedrock = pumpkin_data::Block::BEDROCK.default_state.id;
@@ -638,7 +690,16 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
                         && y < surface - 5
                         && (cheese_cave || spaghetti_cave || noodle_cave);
                     if is_cave {
-                        air
+                        let aquifer = aquifer_noise.get([
+                            world_x as f64 / 72.0,
+                            y as f64 / 38.0,
+                            world_z as f64 / 72.0,
+                        ]);
+                        if y <= -32 && aquifer > -0.15 {
+                            water
+                        } else {
+                            air
+                        }
                     } else {
                         base
                     }
@@ -1569,6 +1630,35 @@ mod tests {
         let underground = &chunk.blocks[..((60 - MIN_Y) as usize * 256)];
         assert!(underground.iter().any(|state| *state == air));
         assert!(underground.iter().any(|state| *state == diamond));
+        let deep_underground = &chunk.blocks[..((-32 - MIN_Y) as usize * 256)];
+        assert!(deep_underground
+            .iter()
+            .any(|state| *state == pumpkin_data::Block::WATER.default_state.id));
+    }
+
+    #[test]
+    fn air_exposure_reduces_ore_placement_but_water_does_not() {
+        let hidden = (1..=10_000)
+            .filter(|hash| ore_placement_allowed(*hash, false, 4))
+            .count();
+        let exposed = (1..=10_000)
+            .filter(|hash| ore_placement_allowed(*hash, true, 4))
+            .count();
+        assert!(hidden > exposed * 3);
+
+        let stone = pumpkin_data::Block::STONE.default_state.id;
+        let mut chunk = SavedChunk {
+            format_version: CHUNK_FORMAT_VERSION,
+            blocks: vec![stone; BLOCKS_PER_CHUNK],
+            biomes: vec![TerrainBiome::Plains.protocol_id(); 256],
+            temperatures: vec![500; 256],
+            surface_y: vec![70; 256],
+        };
+        let neighbor = block_index(9, 0, 8).unwrap();
+        chunk.blocks[neighbor] = pumpkin_data::Block::WATER.default_state.id;
+        assert!(!ore_position_is_exposed_to_air(&chunk, 8, 0, 8));
+        chunk.blocks[neighbor] = pumpkin_data::Block::AIR.default_state.id;
+        assert!(ore_position_is_exposed_to_air(&chunk, 8, 0, 8));
     }
 
     #[test]
