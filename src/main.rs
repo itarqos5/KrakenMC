@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod config;
+mod console;
 mod handlers;
 mod logger;
+mod operator_store;
 mod systems;
 mod viakraken;
 mod world;
@@ -47,7 +49,9 @@ fn print_startup_diagnostics() {
     let version = rustc_version_runtime::version();
     logger::log_info!(
         "Runtime: Rust {}.{}.{}",
-        version.major, version.minor, version.patch
+        version.major,
+        version.minor,
+        version.patch
     );
 
     std::thread::spawn(|| {
@@ -94,13 +98,16 @@ fn main() {
     // 3. Paper-style startup diagnostics
     print_startup_diagnostics();
 
+    let db = world::initialize_world_db();
+    let shutdown_db = Arc::clone(&db);
     ctrlc::set_handler(move || {
         SHUTDOWN.store(true, Ordering::SeqCst);
+        if let Err(error) = shutdown_db.flush() {
+            logger::log_error!("Failed to flush world data during shutdown: {}", error);
+        }
         std::process::exit(0);
     })
     .expect("Error setting Ctrl-C handler");
-
-    let db = world::initialize_world_db();
     println!(
         "{}",
         r#"
@@ -130,12 +137,16 @@ fn main() {
 
     app.insert_resource(WorldDb(db.clone()));
 
-    app.add_plugins(viakraken::ViaKrakenPlugin { config: vk_config, db: db.clone() });
+    app.add_plugins(viakraken::ViaKrakenPlugin {
+        config: vk_config,
+        db: db.clone(),
+    });
     app.add_plugins(systems::persistence::PersistencePlugin);
     app.add_plugins(world::WorldPlugin);
 
     let startup_ms = start_time.elapsed().as_millis();
     logger::log_info!("Done! Startup took {}ms", startup_ms);
+    console::spawn_console();
 
     loop {
         app.update();

@@ -17,7 +17,8 @@ Kraken is a high-performance Rust-based Minecraft server engine designed for low
 - 🧩 **Architecture:** Driven by **Bevy ECS** with a cleanly modularized backend (`src/viakraken/java/backend/`) separated into dedicated state management, packet handlers, and session loops.
 - ⚔️ **Combat & PvP:** Real-time entity interactions including 1-heart melee punch damage, realistic fall damage mechanics, hurt animations (`CEntityStatus`), and broadcasted sound effects (`EntityPlayerHurt`).
 - 🔄 **Player Lifecycle:** Instant respawns, persistent inventory & health tracking, real-time multiplayer tablist synchronization, and interactive `/gamemode` autocompletion.
-- 💾 **Persistence:** Embedded **Sled** key-value database tracking player positions, inventory slots, and block modifications.
+- 💾 **Persistence:** Embedded **Sled** storage for player state, compressed generated chunks, biome climate, and block modifications.
+- 🌍 **World Generation:** Contextual biome borders, temperature, caves, depth-aware ores, and cross-chunk trees with on-demand chunk streaming.
 
 ## 🚀 Getting Started
 
@@ -41,6 +42,36 @@ Before any network listeners or game loops start, Kraken validates the EULA:
    cargo run --release
    ```
 
+### Operators
+
+Kraken creates an empty `ops.json` beside the executable on first login. Add operators using the standard Minecraft format, then reconnect the player:
+
+```json
+[
+  {
+    "uuid": "8667ba71-b85a-4004-af54-457a9734eed7",
+    "name": "Player",
+    "level": 4,
+    "bypassesPlayerLimit": false
+  }
+]
+```
+
+Only operators receive in-game command permission and may use `/gamemode` or the game-mode switcher. Console `/op` and `/deop` changes apply immediately.
+
+### Console Commands
+
+Commands may be entered with or without the leading slash:
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show console command usage. |
+| `/list` | List online players. |
+| `/op <player> [level]` | Grant an online player operator level 1–4. |
+| `/deop <player>` | Remove operator status. |
+| `/kill <player>` | Kill an online player. |
+| `/gamemode <mode> <player>` | Change an online player's game mode. |
+
 ## 🏗️ Technical Architecture
 
 ### Modular Backend Structure (`src/viakraken/java/backend/`)
@@ -59,6 +90,7 @@ By moving synchronous `sysinfo` hardware queries (OS memory and CPU enumeration)
 |------|---------|
 | `eula.txt` | Mojang EULA acceptance flag. Must be `eula=true` to boot. |
 | `server.properties` | Bind IP, port, target protocol, max players, MOTD. |
+| `ops.json` | Operator UUIDs, names, permission levels, and player-limit bypass settings. |
 | `world_data/` | Sled database directory for player and chunk persistence. |
 
 ## 📜 License

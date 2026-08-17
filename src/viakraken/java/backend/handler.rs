@@ -1,12 +1,14 @@
-use std::sync::Arc;
 use bytes::Bytes;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
+use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
     CAcknowledgeBlockChange, CBlockUpdate, CGameEvent, CPlayerAbilities, CPlayerInfoUpdate,
-    CPlayerPosition, CRespawn, CSystemChatMessage, GameEvent, Player, PlayerAction, PlayerInfoFlags,
+    CPlayerPosition, CRespawn, CSetContainerSlot, CSetSelectedSlot, CSystemChatMessage, GameEvent,
+    Player, PlayerAction, PlayerInfoFlags,
 };
 use pumpkin_protocol::java::server::play::SChatMessage;
 use pumpkin_protocol::ServerPacket;
@@ -18,10 +20,41 @@ use pumpkin_util::version::MinecraftVersion;
 use crate::logger::log_info;
 use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::utils::{read_varint_from_slice, write_framed_payload};
-use crate::world::chunk_gen::save_block_change;
+use crate::world::chunk_gen::{get_block_state, save_block_change};
 use crate::world::player_store::PlayerData;
 
-use super::state::{block_channel, chat_channel, gamemode_abilities, online_players, player_event_channel, PlayerEvent};
+use super::state::{
+    block_channel, chat_channel, gamemode_abilities, online_players, player_event_channel,
+    PlayerEvent,
+};
+
+const PLAYER_INVENTORY_SLOTS: usize = 46;
+const HOTBAR_START_SLOT: usize = 36;
+const HOTBAR_SLOT_COUNT: u8 = 9;
+
+fn inventory_item_id(slot: &[u8], version: MinecraftVersion) -> Option<u16> {
+    let mut offset = 0;
+    let item_count = read_varint_from_slice(slot, &mut offset).ok()?;
+    if item_count <= 0 {
+        return None;
+    }
+    let network_item_id = u16::try_from(read_varint_from_slice(slot, &mut offset).ok()?).ok()?;
+    Some(pumpkin_data::item_id_remap::remap_item_id_from_version(
+        network_item_id,
+        version,
+    ))
+}
+
+fn held_block_state(player: &PlayerData, hand: i32, version: MinecraftVersion) -> Option<u16> {
+    let inventory_index = match hand {
+        0 if player.held_slot < HOTBAR_SLOT_COUNT => HOTBAR_START_SLOT + player.held_slot as usize,
+        1 => PLAYER_INVENTORY_SLOTS - 1,
+        _ => return None,
+    };
+    let slot = player.inventory.get(inventory_index)?;
+    let item_id = inventory_item_id(slot, version)?;
+    pumpkin_data::Block::from_item_id(item_id).map(|block| block.default_state.id)
+}
 
 pub async fn handle_play_packet(
     stream: &mut TcpStream,
@@ -47,29 +80,24 @@ pub async fn handle_play_packet(
     let sv_pos_rot = pumpkin_data::packet::serverbound::PLAY_MOVE_PLAYER_POS_ROT.to_id(version);
     let sv_pos = pumpkin_data::packet::serverbound::PLAY_MOVE_PLAYER_POS.to_id(version);
     let sv_chat = pumpkin_data::packet::serverbound::PLAY_CHAT.to_id(version);
-    let sv_creative_slot = pumpkin_data::packet::serverbound::PLAY_SET_CREATIVE_MODE_SLOT.to_id(version);
+    let sv_creative_slot =
+        pumpkin_data::packet::serverbound::PLAY_SET_CREATIVE_MODE_SLOT.to_id(version);
     let sv_held_item = pumpkin_data::packet::serverbound::PLAY_SET_CARRIED_ITEM.to_id(version);
     let sv_player_action = pumpkin_data::packet::serverbound::PLAY_PLAYER_ACTION.to_id(version);
     let sv_client_cmd = pumpkin_data::packet::serverbound::PLAY_CLIENT_COMMAND.to_id(version);
     let sv_interact = pumpkin_data::packet::serverbound::PLAY_INTERACT.to_id(version);
+    let sv_pick_block = pumpkin_data::packet::serverbound::PLAY_PICK_ITEM_FROM_BLOCK.to_id(version);
 
     let mut moved = false;
 
     if pid == sv_use_item_on {
-        let mut o = 0usize;
-        let _hand = read_varint_from_slice(payload, &mut o).unwrap_or(0);
-        if o + 8 <= payload.len() {
-            let packed = i64::from_be_bytes(payload[o..o+8].try_into().unwrap_or_default());
-            o += 8;
-            let face = read_varint_from_slice(payload, &mut o).unwrap_or(0);
-            o += 14;
-            let sequence = read_varint_from_slice(payload, &mut o).unwrap_or(0);
+        use pumpkin_protocol::java::server::play::SUseItemOn;
+        if let Ok(pkt) = SUseItemOn::read(&mut std::io::Cursor::new(payload), &version) {
+            let x = pkt.position.0.x;
+            let y = pkt.position.0.y;
+            let z = pkt.position.0.z;
 
-            let x = (packed >> 38) as i32;
-            let y = ((packed << 52) >> 52) as i32;
-            let z = ((packed << 26) >> 38) as i32;
-
-            let (nx, ny, nz) = match face {
+            let (nx, ny, nz) = match pkt.face.0 {
                 0 => (x, y - 1, z),
                 1 => (x, y + 1, z),
                 2 => (x, y, z - 1),
@@ -78,36 +106,75 @@ pub async fn handle_play_packet(
                 5 => (x + 1, y, z),
                 _ => (x, y + 1, z),
             };
-            let place_pos = BlockPos(Vector3 { x: nx, y: ny, z: nz });
-            
-            let mut block_id = 265;
-            if player.held_slot < 9 {
-                let inventory_idx = player.held_slot as usize + 36;
-                if inventory_idx < player.inventory.len() && !player.inventory[inventory_idx].is_empty() {
-                    let mut cur = 0;
-                    if let Ok(item_count) = crate::viakraken::utils::read_varint_from_slice(&player.inventory[inventory_idx], &mut cur) {
-                        if item_count > 0 {
-                            if let Ok(item_id) = crate::viakraken::utils::read_varint_from_slice(&player.inventory[inventory_idx], &mut cur) {
-                                if let Some(block) = pumpkin_data::Block::from_item_id(item_id as u16) {
-                                    block_id = block.default_state.id as i32;
-                                }
-                            }
-                        }
-                    }
-                }
+
+            if let Some(block_id) = held_block_state(player, pkt.hand.0, version) {
+                save_block_change(db, nx, ny, nz, block_id);
+                let place_pos = BlockPos(Vector3 {
+                    x: nx,
+                    y: ny,
+                    z: nz,
+                });
+                let block_update = CBlockUpdate::new(place_pos, VarInt(block_id as i32));
+                let block_update_payload = encode_java_packet(&block_update, version)?;
+                let _ =
+                    block_channel().send(Bytes::copy_from_slice(block_update_payload.as_slice()));
             }
 
-            save_block_change(db, nx, ny, nz, block_id as u16);
-
-            let block_update = CBlockUpdate::new(place_pos, VarInt(block_id as i32));
-            let block_update_payload = encode_java_packet(&block_update, version)?;
-            let _ = block_channel().send(Bytes::from(block_update_payload.as_slice().to_vec()));
-
-            if sequence > 0 {
-                let ack = CAcknowledgeBlockChange::new(VarInt(sequence));
+            if pkt.sequence.0 > 0 {
+                let ack = CAcknowledgeBlockChange::new(pkt.sequence);
                 let ack_payload = encode_java_packet(&ack, version)?;
                 write_framed_payload(stream, ack_payload.as_slice()).await?;
             }
+        }
+    } else if pid == sv_pick_block && sv_pick_block >= 0 {
+        use pumpkin_data::item::Item;
+        use pumpkin_data::item_stack::ItemStack;
+        use pumpkin_protocol::java::server::play::SPickItemFromBlock;
+
+        if player.gamemode != 1 {
+            return Ok(());
+        }
+        if let Ok(packet) = SPickItemFromBlock::read(&mut std::io::Cursor::new(payload), &version) {
+            let position = packet.pos.0;
+            let state = get_block_state(db, position.x, position.y, position.z);
+            let block = pumpkin_data::Block::from_state_id(state);
+            if block.item_id == 0 {
+                return Ok(());
+            }
+            let Some(item) = Item::from_id(block.item_id) else {
+                return Ok(());
+            };
+
+            let existing_hotbar_slot = (0..HOTBAR_SLOT_COUNT).find(|hotbar_slot| {
+                let inventory_slot = HOTBAR_START_SLOT + *hotbar_slot as usize;
+                player
+                    .inventory
+                    .get(inventory_slot)
+                    .and_then(|slot| inventory_item_id(slot, version))
+                    == Some(block.item_id)
+            });
+            let selected_slot = existing_hotbar_slot.unwrap_or(player.held_slot.min(8));
+            player.held_slot = selected_slot;
+            let inventory_slot = HOTBAR_START_SLOT + selected_slot as usize;
+
+            if existing_hotbar_slot.is_none() {
+                let serialized_item = ItemStackSerializer::from(ItemStack::new(1, item));
+                let mut bytes = Vec::new();
+                serialized_item
+                    .write_with_version(&mut bytes, &version)
+                    .map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                player.inventory[inventory_slot] = bytes;
+                let slot_update =
+                    CSetContainerSlot::new(0, 0, inventory_slot as i16, &serialized_item);
+                let payload = encode_java_packet(&slot_update, version)?;
+                write_framed_payload(stream, payload.as_slice()).await?;
+            }
+
+            let selected = CSetSelectedSlot::new(selected_slot as i8);
+            let payload = encode_java_packet(&selected, version)?;
+            write_framed_payload(stream, payload.as_slice()).await?;
         }
     } else if pid == sv_interact {
         use pumpkin_protocol::java::server::play::SInteract;
@@ -116,7 +183,10 @@ pub async fn handle_play_packet(
                 let target_entity_id = pkt.entity_id.0;
                 let target_info = {
                     let guard = online_players().lock().unwrap();
-                    guard.values().find(|op| op.entity_id == target_entity_id).map(|op| (op.uuid, op.x, op.y, op.z, op.gamemode))
+                    guard
+                        .values()
+                        .find(|op| op.entity_id == target_entity_id)
+                        .map(|op| (op.uuid, op.x, op.y, op.z, op.gamemode))
                 };
                 if let Some((vic_uuid, vx, vy, vz, vic_gm)) = target_info {
                     if vic_gm != 1 && vic_gm != 3 {
@@ -138,7 +208,7 @@ pub async fn handle_play_packet(
         let mut o = 0usize;
         let status = read_varint_from_slice(payload, &mut o).unwrap_or(0);
         if o + 8 <= payload.len() {
-            let pos_val = i64::from_be_bytes(payload[o..o+8].try_into().unwrap_or_default());
+            let pos_val = i64::from_be_bytes(payload[o..o + 8].try_into().unwrap_or_default());
             let x = (pos_val >> 38) as i32;
             let y = ((pos_val << 52) >> 52) as i32;
             let z = ((pos_val << 26) >> 38) as i32;
@@ -153,24 +223,29 @@ pub async fn handle_play_packet(
                 save_block_change(db, x, y, z, 0);
                 let block_update = CBlockUpdate::new(BlockPos(Vector3 { x, y, z }), VarInt(0));
                 if let Ok(block_update_payload) = encode_java_packet(&block_update, version) {
-                    let _ = block_channel().send(Bytes::from(block_update_payload.as_slice().to_vec()));
+                    let _ =
+                        block_channel().send(Bytes::from(block_update_payload.as_slice().to_vec()));
                 }
 
-                use super::state::{ItemEvent, NEXT_ENTITY_ID, item_event_channel};
-                let item_entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = item_event_channel().send(ItemEvent::Spawn {
-                    entity_id: item_entity_id,
-                    item_id: 1,
-                    x: x as f64 + 0.5,
-                    y: y as f64 + 0.5,
-                    z: z as f64 + 0.5,
-                    vx: 0.0,
-                    vy: 0.2,
-                    vz: 0.0,
-                });
+                if player.gamemode != 1 {
+                    use super::state::{item_event_channel, ItemEvent, NEXT_ENTITY_ID};
+                    let item_entity_id =
+                        NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = item_event_channel().send(ItemEvent::Spawn {
+                        entity_id: item_entity_id,
+                        item_id: 1,
+                        x: x as f64 + 0.5,
+                        y: y as f64 + 0.5,
+                        z: z as f64 + 0.5,
+                        vx: 0.0,
+                        vy: 0.2,
+                        vz: 0.0,
+                    });
+                }
             } else if status == 3 || status == 4 {
-                use super::state::{ItemEvent, NEXT_ENTITY_ID, item_event_channel};
-                let item_entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                use super::state::{item_event_channel, ItemEvent, NEXT_ENTITY_ID};
+                let item_entity_id =
+                    NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let yaw_rad = (player.yaw + 90.0) * (std::f32::consts::PI / 180.0);
                 let pitch_rad = -player.pitch * (std::f32::consts::PI / 180.0);
                 let vx = (yaw_rad.cos() * pitch_rad.cos() * 0.3) as f64;
@@ -200,21 +275,43 @@ pub async fn handle_play_packet(
         use pumpkin_protocol::java::server::play::SSetCreativeSlot;
         if let Ok(pkt) = SSetCreativeSlot::read(&mut std::io::Cursor::new(payload), &version) {
             let slot = pkt.slot;
-            if slot >= 0 && slot < 46 {
+            if player.gamemode == 1 && slot >= 1 && slot < PLAYER_INVENTORY_SLOTS as i16 {
+                let item_stack = pkt.clicked_item.to_stack_for_version(&version);
+                let is_legal = item_stack.is_empty()
+                    || item_stack.item_count <= item_stack.get_max_stack_size();
+                if !is_legal {
+                    return Ok(());
+                }
+
+                let serialized_item = ItemStackSerializer::from(item_stack);
                 let mut buf = Vec::new();
-                if pkt.clicked_item.write_with_version(&mut buf, &version).is_ok() {
+                if serialized_item
+                    .write_with_version(&mut buf, &version)
+                    .is_ok()
+                {
                     player.inventory[slot as usize] = buf;
+
+                    let slot_update = CSetContainerSlot::new(0, 0, slot, &serialized_item);
+                    let update_payload = encode_java_packet(&slot_update, version)?;
+                    write_framed_payload(stream, update_payload.as_slice()).await?;
                 }
             }
         }
     } else if pid == sv_held_item {
-        if payload.len() >= 2 {
-            player.held_slot = payload[1];
+        use pumpkin_protocol::java::server::play::SSetHeldItem;
+        if let Ok(pkt) = SSetHeldItem::read(&mut std::io::Cursor::new(payload), &version) {
+            if (0..HOTBAR_SLOT_COUNT as i16).contains(&pkt.slot) {
+                player.held_slot = pkt.slot as u8;
+            }
         }
     } else if pid == sv_change_gm && sv_change_gm >= 0 {
-        let mut o = 0usize;
-        let gm_id = read_varint_from_slice(payload, &mut o).unwrap_or(0);
-        change_gamemode(stream, version, player, uuid, gm_id as u8).await?;
+        if player.operator_level > 0 {
+            let mut o = 0usize;
+            let gm_id = read_varint_from_slice(payload, &mut o).unwrap_or(0);
+            if (0..=3).contains(&gm_id) {
+                change_gamemode(stream, version, player, uuid, gm_id as u8).await?;
+            }
+        }
     } else if pid == sv_chat_cmd {
         let mut o = 0usize;
         let cmd_len = read_varint_from_slice(payload, &mut o).unwrap_or(0) as usize;
@@ -230,7 +327,7 @@ pub async fn handle_play_packet(
             player.z = f64::from_be_bytes(payload[16..24].try_into().unwrap_or_default());
             player.yaw = f32::from_be_bytes(payload[24..28].try_into().unwrap_or_default());
             player.pitch = f32::from_be_bytes(payload[28..32].try_into().unwrap_or_default());
-            
+
             let on_ground = payload[32] != 0;
             process_fall_damage(stream, player, on_ground, my_entity_id, uuid).await?;
             moved = true;
@@ -240,7 +337,7 @@ pub async fn handle_play_packet(
             player.x = f64::from_be_bytes(payload[0..8].try_into().unwrap_or_default());
             player.y = f64::from_be_bytes(payload[8..16].try_into().unwrap_or_default());
             player.z = f64::from_be_bytes(payload[16..24].try_into().unwrap_or_default());
-            
+
             let on_ground = payload[24] != 0;
             process_fall_damage(stream, player, on_ground, my_entity_id, uuid).await?;
             moved = true;
@@ -290,8 +387,16 @@ pub async fn handle_play_packet(
 
                 let pos_pkt = CPlayerPosition::new(
                     VarInt(1),
-                    Vector3 { x: 0.0, y: 70.0, z: 0.0 },
-                    Vector3 { x: 0.0, y: 0.0, z: 0.0 },
+                    Vector3 {
+                        x: 0.0,
+                        y: 70.0,
+                        z: 0.0,
+                    },
+                    Vector3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
                     0.0,
                     0.0,
                     vec![],
@@ -305,8 +410,13 @@ pub async fn handle_play_packet(
                     let _ = write_framed_payload(stream, payload.as_slice()).await;
                 }
 
-                use pumpkin_protocol::java::client::play::{CCenterChunk, CChunkBatchStart, CChunkBatchEnd};
-                let center = CCenterChunk { chunk_x: VarInt(0), chunk_z: VarInt(0) };
+                use pumpkin_protocol::java::client::play::{
+                    CCenterChunk, CChunkBatchEnd, CChunkBatchStart,
+                };
+                let center = CCenterChunk {
+                    chunk_x: VarInt(0),
+                    chunk_z: VarInt(0),
+                };
                 if let Ok(payload) = encode_java_packet(&center, version) {
                     let _ = write_framed_payload(stream, payload.as_slice()).await;
                 }
@@ -320,8 +430,9 @@ pub async fn handle_play_packet(
                 let proto_ver = version.protocol_version();
                 for dz in -3i32..=3 {
                     for dx in -3i32..=3 {
-                        let chunk_data = crate::world::chunk_gen::encode_chunk_packet(dx, dz, proto_ver, db);
-                        let _ = write_framed_payload(stream, &chunk_data).await;
+                        let chunk_data =
+                            crate::world::chunk_gen::encode_chunk_packet(dx, dz, proto_ver, db);
+                        let _ = write_framed_payload(stream, chunk_data.as_slice()).await;
                         chunk_count += 1;
                     }
                 }
@@ -340,11 +451,19 @@ pub async fn handle_play_packet(
         player.x = 0.0;
         player.y = 70.0;
         player.z = 0.0;
-        
+
         let pos_pkt = CPlayerPosition::new(
             VarInt(1),
-            Vector3 { x: player.x, y: player.y, z: player.z },
-            Vector3 { x: 0.0, y: 0.0, z: 0.0 },
+            Vector3 {
+                x: player.x,
+                y: player.y,
+                z: player.z,
+            },
+            Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             player.yaw,
             player.pitch,
             vec![],
@@ -395,10 +514,7 @@ pub async fn change_gamemode(
         }
     }
 
-    let _ = player_event_channel().send(PlayerEvent::GamemodeChange {
-        uuid,
-        gamemode: gm,
-    });
+    let _ = player_event_channel().send(PlayerEvent::GamemodeChange { uuid, gamemode: gm });
 
     let ge = CGameEvent::new(GameEvent::ChangeGameMode, gm as f32);
     let payload = encode_java_packet(&ge, version)?;
@@ -409,9 +525,7 @@ pub async fn change_gamemode(
     let payload = encode_java_packet(&abilities, version)?;
     write_framed_payload(stream, payload.as_slice()).await?;
 
-    let actions = vec![
-        PlayerAction::UpdateGameMode(VarInt(gm as i32)),
-    ];
+    let actions = vec![PlayerAction::UpdateGameMode(VarInt(gm as i32))];
     let players = vec![Player {
         uuid,
         actions: &actions,
@@ -433,6 +547,15 @@ async fn handle_command(
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if !parts.is_empty() {
         if parts[0] == "gamemode" && parts.len() > 1 {
+            if player.operator_level == 0 {
+                send_system_message(
+                    stream,
+                    version,
+                    "You do not have permission to use this command.",
+                )
+                .await?;
+                return Ok(());
+            }
             let gm_name = parts[1].to_lowercase();
             let new_gm = match gm_name.as_str() {
                 "survival" | "0" => Some(0),
@@ -447,7 +570,12 @@ async fn handle_command(
                 send_system_message(stream, version, &msg_text).await?;
                 log_info!("{}: /gamemode {}", username, parts[1]);
             } else {
-                send_system_message(stream, version, "Unknown gamemode. Use: survival, creative, adventure, spectator").await?;
+                send_system_message(
+                    stream,
+                    version,
+                    "Unknown gamemode. Use: survival, creative, adventure, spectator",
+                )
+                .await?;
             }
         } else {
             send_system_message(stream, version, &format!("Unknown command: /{}", cmd)).await?;
@@ -496,4 +624,15 @@ pub async fn send_system_message(
     let msg = CSystemChatMessage::new(&content, false);
     let payload = encode_java_packet(&msg, version)?;
     write_framed_payload(stream, payload.as_slice()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_hand_has_no_placeable_block() {
+        let player = PlayerData::default();
+        assert_eq!(held_block_state(&player, 0, MinecraftVersion::V_26_1), None);
+    }
 }

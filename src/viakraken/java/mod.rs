@@ -1,4 +1,4 @@
-mod backend;
+pub(crate) mod backend;
 mod connection;
 mod handoff;
 mod packets;

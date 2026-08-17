@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::AtomicI32;
 use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicI32;
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 pub fn chat_channel() -> &'static tokio::sync::broadcast::Sender<String> {
@@ -90,11 +90,26 @@ pub fn online_players() -> &'static Mutex<HashMap<Uuid, OnlinePlayer>> {
 
 pub static NEXT_ENTITY_ID: AtomicI32 = AtomicI32::new(1);
 
+#[derive(Clone, Debug)]
+pub enum ConsoleCommand {
+    OperatorLevel { uuid: Uuid, level: u8 },
+    Kill { uuid: Uuid },
+    Gamemode { uuid: Uuid, gamemode: u8 },
+}
+
+pub fn console_command_channel() -> &'static tokio::sync::broadcast::Sender<ConsoleCommand> {
+    static CHANNEL: OnceLock<tokio::sync::broadcast::Sender<ConsoleCommand>> = OnceLock::new();
+    CHANNEL.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        tx
+    })
+}
+
 pub fn gamemode_abilities(gamemode: u8) -> (i8, f32) {
     match gamemode {
         1 => (0x01 | 0x04 | 0x08, 0.05), // invulnerable + allow fly + instant break
-        3 => (0x02 | 0x04, 0.05),         // flying + allow fly (spectator)
-        _ => (0, 0.05),                    // survival/adventure: nothing
+        3 => (0x02 | 0x04, 0.05),        // flying + allow fly (spectator)
+        _ => (0, 0.05),                  // survival/adventure: nothing
     }
 }
 

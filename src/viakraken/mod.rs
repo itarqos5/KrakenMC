@@ -8,7 +8,7 @@ use crate::config::ServerConfig;
 use crate::logger::{log_error, log_info, log_warn};
 
 mod bedrock;
-mod java;
+pub(crate) mod java;
 mod utils;
 
 pub struct ViaKrakenPlugin {

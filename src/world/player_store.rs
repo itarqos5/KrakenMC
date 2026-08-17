@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Persisted player data stored on disconnect, loaded on login.
@@ -19,9 +19,14 @@ pub struct PlayerData {
     pub held_slot: u8,
     #[serde(default = "default_health")]
     pub health: f32,
+    /// Runtime permission state loaded from ops.json; never persisted with player data.
+    #[serde(skip)]
+    pub operator_level: u8,
 }
 
-fn default_health() -> f32 { 20.0 }
+fn default_health() -> f32 {
+    20.0
+}
 
 impl Default for PlayerData {
     fn default() -> Self {
@@ -36,19 +41,18 @@ impl Default for PlayerData {
             highest_y: 70.0,
             held_slot: 0,
             health: 20.0,
+            operator_level: 0,
         }
     }
 }
 
-pub fn save_player(db: &Arc<sled::Db>, uuid: Uuid, data: &PlayerData) {
+pub fn save_player(db: &Arc<sled::Db>, uuid: Uuid, data: &PlayerData) -> sled::Result<()> {
     let key = format!("player:{}", uuid);
     match postcard::to_allocvec(data) {
-        Ok(bytes) => {
-            let _ = db.insert(key.as_bytes(), bytes);
-            let _ = db.flush();
-        }
+        Ok(bytes) => db.insert(key.as_bytes(), bytes).map(|_| ()),
         Err(e) => {
             crate::logger::log_error!("Failed to serialize player data for {}: {}", uuid, e);
+            Ok(())
         }
     }
 }
@@ -61,4 +65,31 @@ pub fn load_player(db: &Arc<sled::Db>, uuid: Uuid) -> PlayerData {
         }
     }
     PlayerData::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn player_transform_and_inventory_round_trip() {
+        let db = Arc::new(sled::Config::new().temporary(true).open().unwrap());
+        let uuid = Uuid::new_v4();
+        let mut player = PlayerData::default();
+        player.x = -31.5;
+        player.y = 82.0;
+        player.z = 144.25;
+        player.yaw = 123.0;
+        player.pitch = -42.5;
+        player.inventory[36] = vec![1, 2, 3, 4];
+        player.operator_level = 4;
+
+        save_player(&db, uuid, &player).unwrap();
+        let loaded = load_player(&db, uuid);
+
+        assert_eq!((loaded.x, loaded.y, loaded.z), (-31.5, 82.0, 144.25));
+        assert_eq!((loaded.yaw, loaded.pitch), (123.0, -42.5));
+        assert_eq!(loaded.inventory[36], vec![1, 2, 3, 4]);
+        assert_eq!(loaded.operator_level, 0);
+    }
 }

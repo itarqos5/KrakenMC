@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::io::Error;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -5,10 +7,10 @@ use uuid::Uuid;
 
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
-    CCenterChunk, CChunkBatchEnd, CChunkBatchStart, CCommands, CEntityStatus, CGameEvent,
-    CKeepAlive, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition, CPlayerSpawnPosition,
-    CRemoveEntities, CRemovePlayerInfo, CSpawnEntity, CTeleportEntity, GameEvent, Player,
-    PlayerAction, PlayerInfoFlags, ProtoNode, ProtoNodeType, CCustomPayload, CHeadRot,
+    CCenterChunk, CChunkBatchEnd, CChunkBatchStart, CCommands, CCustomPayload, CEntityStatus,
+    CGameEvent, CHeadRot, CKeepAlive, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition,
+    CPlayerSpawnPosition, CRemoveEntities, CRemovePlayerInfo, CSpawnEntity, CTeleportEntity,
+    CUnloadChunk, GameEvent, Player, PlayerAction, PlayerInfoFlags, ProtoNode, ProtoNodeType,
 };
 use pumpkin_protocol::ser::NetworkWriteExt;
 use pumpkin_protocol::PositionFlag;
@@ -18,16 +20,171 @@ use pumpkin_util::version::MinecraftVersion;
 
 use crate::config::ServerConfig;
 use crate::logger::{log_info, log_warn};
+use crate::operator_store::operator_level;
 use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::utils::{read_varint_from_slice, write_framed_payload};
 use crate::world::chunk_gen::encode_chunk_packet;
 use crate::world::player_store::{load_player, save_player};
 
-use super::handler::handle_play_packet;
+use super::handler::{change_gamemode, handle_play_packet};
 use super::state::{
-    block_channel, chat_channel, gamemode_abilities, online_players, player_event_channel,
-    NEXT_ENTITY_ID, OnlinePlayer, PlayerEvent,
+    block_channel, chat_channel, console_command_channel, gamemode_abilities, online_players,
+    player_event_channel, ConsoleCommand, OnlinePlayer, PlayerEvent, NEXT_ENTITY_ID,
 };
+
+const VIEW_DISTANCE: i32 = 3;
+
+async fn send_permission_status(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    entity_id: i32,
+    operator_level: u8,
+) -> std::io::Result<()> {
+    let status = CEntityStatus::new(entity_id, (24 + operator_level.clamp(0, 4)) as i8);
+    let payload = encode_java_packet(&status, version)?;
+    write_framed_payload(stream, payload.as_slice()).await
+}
+
+async fn send_command_tree(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    is_operator: bool,
+) -> std::io::Result<()> {
+    let root_children = if is_operator {
+        vec![VarInt(1)]
+    } else {
+        Vec::new()
+    };
+    let nodes = vec![
+        ProtoNode {
+            children: root_children.into_boxed_slice(),
+            node_type: ProtoNodeType::Root,
+        },
+        ProtoNode {
+            children: vec![VarInt(2), VarInt(3), VarInt(4), VarInt(5)].into_boxed_slice(),
+            node_type: ProtoNodeType::Literal {
+                name: "gamemode",
+                is_executable: false,
+                redirect_target: None,
+                restricted: true,
+            },
+        },
+        ProtoNode {
+            children: vec![].into_boxed_slice(),
+            node_type: ProtoNodeType::Literal {
+                name: "survival",
+                is_executable: true,
+                redirect_target: None,
+                restricted: false,
+            },
+        },
+        ProtoNode {
+            children: vec![].into_boxed_slice(),
+            node_type: ProtoNodeType::Literal {
+                name: "creative",
+                is_executable: true,
+                redirect_target: None,
+                restricted: false,
+            },
+        },
+        ProtoNode {
+            children: vec![].into_boxed_slice(),
+            node_type: ProtoNodeType::Literal {
+                name: "adventure",
+                is_executable: true,
+                redirect_target: None,
+                restricted: false,
+            },
+        },
+        ProtoNode {
+            children: vec![].into_boxed_slice(),
+            node_type: ProtoNodeType::Literal {
+                name: "spectator",
+                is_executable: true,
+                redirect_target: None,
+                restricted: false,
+            },
+        },
+    ];
+    let commands = CCommands::new(nodes.into_boxed_slice(), VarInt(0));
+    let payload = encode_java_packet(&commands, version)?;
+    write_framed_payload(stream, payload.as_slice()).await
+}
+
+fn chunk_coordinate(block_coordinate: f64) -> i32 {
+    (block_coordinate.floor() as i32) >> 4
+}
+
+fn chunks_in_view(center_x: i32, center_z: i32) -> HashSet<(i32, i32)> {
+    let diameter = (VIEW_DISTANCE * 2 + 1) as usize;
+    let mut chunks = HashSet::with_capacity(diameter * diameter);
+    for dz in -VIEW_DISTANCE..=VIEW_DISTANCE {
+        for dx in -VIEW_DISTANCE..=VIEW_DISTANCE {
+            chunks.insert((center_x + dx, center_z + dz));
+        }
+    }
+    chunks
+}
+
+async fn stream_chunks(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    protocol_version: i32,
+    db: &Arc<sled::Db>,
+    center_x: i32,
+    center_z: i32,
+    sent_chunks: &mut HashSet<(i32, i32)>,
+) -> std::io::Result<()> {
+    let center = CCenterChunk {
+        chunk_x: VarInt(center_x),
+        chunk_z: VarInt(center_z),
+    };
+    let payload = encode_java_packet(&center, version)?;
+    write_framed_payload(stream, payload.as_slice()).await?;
+
+    let desired_chunks = chunks_in_view(center_x, center_z);
+    for &(chunk_x, chunk_z) in sent_chunks.difference(&desired_chunks) {
+        let unload = CUnloadChunk::new(chunk_x, chunk_z);
+        let payload = encode_java_packet(&unload, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+    }
+
+    let mut missing_chunks: Vec<_> = desired_chunks.difference(sent_chunks).copied().collect();
+    missing_chunks.sort_unstable_by_key(|(chunk_x, chunk_z)| {
+        let dx = chunk_x - center_x;
+        let dz = chunk_z - center_z;
+        dx * dx + dz * dz
+    });
+
+    if !missing_chunks.is_empty() {
+        let batch_start = CChunkBatchStart;
+        let payload = encode_java_packet(&batch_start, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+
+        let generation_db = Arc::clone(db);
+        let packets = tokio::task::spawn_blocking(move || {
+            missing_chunks
+                .into_iter()
+                .map(|(chunk_x, chunk_z)| {
+                    encode_chunk_packet(chunk_x, chunk_z, protocol_version, &generation_db)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|error| Error::other(format!("chunk generation task failed: {error}")))?;
+
+        for packet in &packets {
+            write_framed_payload(stream, packet.as_slice()).await?;
+        }
+
+        let batch_end = CChunkBatchEnd::new(packets.len() as u16);
+        let payload = encode_java_packet(&batch_end, version)?;
+        write_framed_payload(stream, payload.as_slice()).await?;
+    }
+
+    *sent_chunks = desired_chunks;
+    Ok(())
+}
 
 pub async fn handle_play(
     stream: &mut TcpStream,
@@ -39,6 +196,7 @@ pub async fn handle_play(
     db: Arc<sled::Db>,
 ) -> std::io::Result<()> {
     let mut player = load_player(&db, uuid);
+    player.operator_level = operator_level(uuid, username);
     if player.inventory.len() != 46 {
         player.inventory = vec![vec![]; 46];
     }
@@ -69,62 +227,8 @@ pub async fn handle_play(
     let login_play_payload = encode_java_packet(&login_play, version)?;
     write_framed_payload(stream, login_play_payload.as_slice()).await?;
 
-    {
-        let nodes = vec![
-            ProtoNode {
-                children: vec![VarInt(1)].into_boxed_slice(),
-                node_type: ProtoNodeType::Root,
-            },
-            ProtoNode {
-                children: vec![VarInt(2), VarInt(3), VarInt(4), VarInt(5)].into_boxed_slice(),
-                node_type: ProtoNodeType::Literal {
-                    name: "gamemode",
-                    is_executable: false,
-                    redirect_target: None,
-                    restricted: false,
-                },
-            },
-            ProtoNode {
-                children: vec![].into_boxed_slice(),
-                node_type: ProtoNodeType::Literal {
-                    name: "survival",
-                    is_executable: true,
-                    redirect_target: None,
-                    restricted: false,
-                },
-            },
-            ProtoNode {
-                children: vec![].into_boxed_slice(),
-                node_type: ProtoNodeType::Literal {
-                    name: "creative",
-                    is_executable: true,
-                    redirect_target: None,
-                    restricted: false,
-                },
-            },
-            ProtoNode {
-                children: vec![].into_boxed_slice(),
-                node_type: ProtoNodeType::Literal {
-                    name: "adventure",
-                    is_executable: true,
-                    redirect_target: None,
-                    restricted: false,
-                },
-            },
-            ProtoNode {
-                children: vec![].into_boxed_slice(),
-                node_type: ProtoNodeType::Literal {
-                    name: "spectator",
-                    is_executable: true,
-                    redirect_target: None,
-                    restricted: false,
-                },
-            }
-        ];
-        let cmds = CCommands::new(nodes.into_boxed_slice(), VarInt(0));
-        let cmds_payload = encode_java_packet(&cmds, version)?;
-        write_framed_payload(stream, cmds_payload.as_slice()).await?;
-    }
+    send_permission_status(stream, version, my_entity_id, player.operator_level).await?;
+    send_command_tree(stream, version, player.operator_level > 0).await?;
 
     {
         let flags = (PlayerInfoFlags::ADD_PLAYER
@@ -190,12 +294,20 @@ pub async fn handle_play(
                 VarInt(other.entity_id),
                 other.uuid,
                 VarInt(pumpkin_data::entity::EntityType::PLAYER.id as i32),
-                Vector3 { x: other.x, y: other.y, z: other.z },
+                Vector3 {
+                    x: other.x,
+                    y: other.y,
+                    z: other.z,
+                },
                 other.pitch,
                 other.yaw,
                 other.yaw,
                 VarInt(0),
-                Vector3 { x: 0.0, y: 0.0, z: 0.0 },
+                Vector3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
             );
             if let Ok(payload) = encode_java_packet(&spawn_pkt, version) {
                 let _ = write_framed_payload(stream, payload.as_slice()).await;
@@ -205,17 +317,20 @@ pub async fn handle_play(
 
     {
         let mut players_guard = online_players().lock().unwrap();
-        players_guard.insert(uuid, OnlinePlayer {
-            entity_id: my_entity_id,
+        players_guard.insert(
             uuid,
-            username: username.to_string(),
-            x: player.x,
-            y: player.y,
-            z: player.z,
-            yaw: player.yaw,
-            pitch: player.pitch,
-            gamemode: player.gamemode,
-        });
+            OnlinePlayer {
+                entity_id: my_entity_id,
+                uuid,
+                username: username.to_string(),
+                x: player.x,
+                y: player.y,
+                z: player.z,
+                yaw: player.yaw,
+                pitch: player.pitch,
+                gamemode: player.gamemode,
+            },
+        );
     }
 
     {
@@ -255,7 +370,9 @@ pub async fn handle_play(
         let _ = buf.write_var_int(&VarInt(0));
 
         let mut pkt_buf = Vec::new();
-        let _ = pkt_buf.write_var_int(&VarInt(pumpkin_data::packet::clientbound::PLAY_CONTAINER_SET_CONTENT.to_id(version) as i32));
+        let _ = pkt_buf.write_var_int(&VarInt(
+            pumpkin_data::packet::clientbound::PLAY_CONTAINER_SET_CONTENT.to_id(version),
+        ));
         pkt_buf.extend_from_slice(&buf);
         let _ = write_framed_payload(stream, &pkt_buf).await;
     }
@@ -269,7 +386,8 @@ pub async fn handle_play(
 
     {
         let spawn_pos = BlockPos(Vector3 { x: 0, y: 70, z: 0 });
-        let spawn_pkt = CPlayerSpawnPosition::new(spawn_pos, 0.0, 0.0, "minecraft:overworld".to_string());
+        let spawn_pkt =
+            CPlayerSpawnPosition::new(spawn_pos, 0.0, 0.0, "minecraft:overworld".to_string());
         let payload = encode_java_packet(&spawn_pkt, version)?;
         write_framed_payload(stream, payload.as_slice()).await?;
     }
@@ -277,8 +395,16 @@ pub async fn handle_play(
     {
         let pos_pkt = CPlayerPosition::new(
             VarInt(1),
-            Vector3 { x: player.x, y: player.y, z: player.z },
-            Vector3 { x: 0.0, y: 0.0, z: 0.0 },
+            Vector3 {
+                x: player.x,
+                y: player.y,
+                z: player.z,
+            },
+            Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             player.yaw,
             player.pitch,
             vec![],
@@ -293,38 +419,18 @@ pub async fn handle_play(
         write_framed_payload(stream, payload.as_slice()).await?;
     }
 
-    let chunk_x = (player.x as i32) >> 4;
-    let chunk_z = (player.z as i32) >> 4;
-    {
-        let center = CCenterChunk { chunk_x: VarInt(chunk_x), chunk_z: VarInt(chunk_z) };
-        let payload = encode_java_packet(&center, version)?;
-        write_framed_payload(stream, payload.as_slice()).await?;
-    }
-
-    let batch_start = CChunkBatchStart;
-    let start_payload = encode_java_packet(&batch_start, version)?;
-    write_framed_payload(stream, start_payload.as_slice()).await?;
-
-    let mut chunk_count = 0u16;
-    for dz in -3i32..=3 {
-        for dx in -3i32..=3 {
-            let cx = chunk_x + dx;
-            let cz = chunk_z + dz;
-            let chunk_data = encode_chunk_packet(cx, cz, protocol_version, &db);
-            write_framed_payload(stream, &chunk_data).await?;
-            chunk_count += 1;
-        }
-    }
-
-    let batch_end = CChunkBatchEnd::new(chunk_count);
-    let end_payload = encode_java_packet(&batch_end, version)?;
-    write_framed_payload(stream, end_payload.as_slice()).await?;
-
-    {
-        let op_status = CEntityStatus::new(my_entity_id, 28);
-        let payload = encode_java_packet(&op_status, version)?;
-        write_framed_payload(stream, payload.as_slice()).await?;
-    }
+    let mut center_chunk = (chunk_coordinate(player.x), chunk_coordinate(player.z));
+    let mut sent_chunks = HashSet::new();
+    stream_chunks(
+        stream,
+        version,
+        protocol_version,
+        &db,
+        center_chunk.0,
+        center_chunk.1,
+        &mut sent_chunks,
+    )
+    .await?;
 
     {
         let brand_data = b"\x06Kraken";
@@ -334,14 +440,18 @@ pub async fn handle_play(
     }
 
     log_info!(
-        "Login flow completed for {} (protocol={}, max_players={}, pos=({:.1},{:.1},{:.1}))",
+        "Login flow completed for {} (protocol={}, max_players={}, operator={}, pos=({:.1},{:.1},{:.1}))",
         username,
         protocol_version,
         config.max_players,
+        player.operator_level > 0,
         player.x, player.y, player.z
     );
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut save_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    save_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    save_interval.reset();
     let mut keep_alive_id = 0i64;
     let mut buf = vec![0u8; 65536];
     let mut pending_bytes = Vec::new();
@@ -349,9 +459,35 @@ pub async fn handle_play(
     let mut block_rx = block_channel().subscribe();
     let mut event_rx = player_event_channel().subscribe();
     let mut item_rx = crate::viakraken::java::backend::state::item_event_channel().subscribe();
+    let mut console_rx = console_command_channel().subscribe();
 
     'play: loop {
         tokio::select! {
+            Ok(command) = console_rx.recv() => {
+                match command {
+                    ConsoleCommand::OperatorLevel { uuid: target, level } if target == uuid => {
+                        player.operator_level = level.clamp(0, 4);
+                        send_permission_status(stream, version, my_entity_id, player.operator_level).await?;
+                        send_command_tree(stream, version, player.operator_level > 0).await?;
+                    }
+                    ConsoleCommand::Kill { uuid: target } if target == uuid => {
+                        player.health = 0.0;
+                        let health = pumpkin_protocol::java::client::play::CSetHealth::new(
+                            0.0,
+                            VarInt(20),
+                            20.0,
+                        );
+                        let payload = encode_java_packet(&health, version)?;
+                        write_framed_payload(stream, payload.as_slice()).await?;
+                        log_info!("Killed {} from the console.", username);
+                    }
+                    ConsoleCommand::Gamemode { uuid: target, gamemode } if target == uuid => {
+                        change_gamemode(stream, version, &mut player, uuid, gamemode).await?;
+                        log_info!("Set {} to game mode {} from the console.", username, gamemode);
+                    }
+                    _ => {}
+                }
+            }
             Ok(event) = event_rx.recv() => {
                 match event {
                     PlayerEvent::Join { entity_id, uuid: other_uuid, username: other_name, x, y, z, yaw, pitch, gamemode } => {
@@ -467,7 +603,7 @@ pub async fn handle_play(
                             if let Ok(payload) = encode_java_packet(&hp, version) {
                                 let _ = write_framed_payload(stream, payload.as_slice()).await;
                             }
-                            
+
                             use pumpkin_protocol::java::client::play::CEntityVelocity;
                             let vel = CEntityVelocity::new(
                                 VarInt(my_entity_id),
@@ -560,6 +696,13 @@ pub async fn handle_play(
                     let _ = write_framed_payload(stream, payload.as_slice()).await;
                 }
             }
+            _ = save_interval.tick() => {
+                if let Err(error) = save_player(&db, uuid, &player) {
+                    log_warn!("Failed to save player {}: {}", username, error);
+                } else if let Err(error) = db.flush_async().await {
+                    log_warn!("Failed to flush world data: {}", error);
+                }
+            }
             res = stream.read(&mut buf) => {
                 match res {
                     Ok(0) => break 'play,
@@ -587,6 +730,29 @@ pub async fn handle_play(
                             ).await {
                                 log_warn!("Play packet error for {}: {}", username, e);
                             }
+
+                            let current_chunk = (
+                                chunk_coordinate(player.x),
+                                chunk_coordinate(player.z),
+                            );
+                            if current_chunk != center_chunk {
+                                match stream_chunks(
+                                    stream,
+                                    version,
+                                    protocol_version,
+                                    &db,
+                                    current_chunk.0,
+                                    current_chunk.1,
+                                    &mut sent_chunks,
+                                )
+                                .await
+                                {
+                                    Ok(()) => center_chunk = current_chunk,
+                                    Err(error) => {
+                                        log_warn!("Failed to stream chunks for {}: {}", username, error);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -594,7 +760,16 @@ pub async fn handle_play(
         }
     }
 
-    save_player(&db, uuid, &player);
+    if let Err(error) = save_player(&db, uuid, &player) {
+        log_warn!(
+            "Failed to save player {} on disconnect: {}",
+            username,
+            error
+        );
+    }
+    if let Err(error) = db.flush_async().await {
+        log_warn!("Failed to flush world data on disconnect: {}", error);
+    }
     {
         let mut players_guard = online_players().lock().unwrap();
         players_guard.remove(&uuid);
@@ -607,4 +782,29 @@ pub async fn handle_play(
 
     log_info!("Player {} disconnected, state saved.", username);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_coordinates_floor_negative_positions() {
+        assert_eq!(chunk_coordinate(0.0), 0);
+        assert_eq!(chunk_coordinate(15.99), 0);
+        assert_eq!(chunk_coordinate(16.0), 1);
+        assert_eq!(chunk_coordinate(-0.01), -1);
+        assert_eq!(chunk_coordinate(-16.0), -1);
+        assert_eq!(chunk_coordinate(-16.01), -2);
+    }
+
+    #[test]
+    fn moving_one_chunk_only_requests_the_new_edge() {
+        let old_view = chunks_in_view(0, 0);
+        let new_view = chunks_in_view(1, 0);
+
+        assert_eq!(old_view.len(), 49);
+        assert_eq!(new_view.difference(&old_view).count(), 7);
+        assert_eq!(old_view.difference(&new_view).count(), 7);
+    }
 }
