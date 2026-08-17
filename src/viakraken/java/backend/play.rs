@@ -178,6 +178,20 @@ fn entity_death_loot(entity_type: u16) -> Option<(u16, u8)> {
     }
 }
 
+fn player_damage_sound(damage: f32, has_attacker: bool) -> pumpkin_data::sound::Sound {
+    if has_attacker {
+        pumpkin_data::sound::Sound::EntityPlayerHurt
+    } else if damage > 4.0 {
+        pumpkin_data::sound::Sound::EntityPlayerBigFall
+    } else {
+        pumpkin_data::sound::Sound::EntityPlayerSmallFall
+    }
+}
+
+fn damage_applies_knockback(attacker_x: Option<f64>, attacker_z: Option<f64>) -> bool {
+    attacker_x.is_some() && attacker_z.is_some()
+}
+
 fn tick_summoned_zombies(db: &Arc<sled::Db>) {
     static LAST_TICK: OnceLock<Mutex<Instant>> = OnceLock::new();
     let now = Instant::now();
@@ -909,13 +923,15 @@ pub async fn handle_play(
                                 let _ = write_framed_payload(stream, payload.as_slice()).await;
                             }
 
-                            use pumpkin_protocol::java::client::play::CEntityVelocity;
-                            let vel = CEntityVelocity::new(
-                                VarInt(my_entity_id),
-                                Vector3::new(kb_x, 0.35, kb_z),
-                            );
-                            if let Ok(payload) = encode_java_packet(&vel, version) {
-                                let _ = write_framed_payload(stream, payload.as_slice()).await;
+                            if damage_applies_knockback(attacker_x, attacker_z) {
+                                use pumpkin_protocol::java::client::play::CEntityVelocity;
+                                let vel = CEntityVelocity::new(
+                                    VarInt(my_entity_id),
+                                    Vector3::new(kb_x, 0.35, kb_z),
+                                );
+                                if let Ok(payload) = encode_java_packet(&vel, version) {
+                                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                                }
                             }
                         }
                         let status = CEntityStatus::new(entity_id, 2);
@@ -926,7 +942,7 @@ pub async fn handle_play(
                         use pumpkin_protocol::IdOr;
                         use pumpkin_data::sound::SoundCategory;
                         let hurt_sound = CSoundEffect::new(
-                            IdOr::Id(pumpkin_data::sound::Sound::EntityPlayerHurt as u16),
+                            IdOr::Id(player_damage_sound(damage, attacker_x.is_some()) as u16),
                             SoundCategory::Players,
                             &Vector3::new(x, y, z),
                             1.0,
@@ -1223,6 +1239,24 @@ mod tests {
         assert_eq!(
             drop_destination_slot(&player, version, pumpkin_data::item::Item::STONE.id, 1),
             Some((37, 13))
+        );
+    }
+
+    #[test]
+    fn fall_damage_uses_fall_sounds_without_attack_knockback() {
+        assert!(!damage_applies_knockback(None, None));
+        assert!(damage_applies_knockback(Some(0.0), Some(0.0)));
+        assert_eq!(
+            player_damage_sound(2.0, false) as u16,
+            pumpkin_data::sound::Sound::EntityPlayerSmallFall as u16
+        );
+        assert_eq!(
+            player_damage_sound(8.0, false) as u16,
+            pumpkin_data::sound::Sound::EntityPlayerBigFall as u16
+        );
+        assert_eq!(
+            player_damage_sound(1.0, true) as u16,
+            pumpkin_data::sound::Sound::EntityPlayerHurt as u16
         );
     }
 
