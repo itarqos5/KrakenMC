@@ -5,9 +5,9 @@ use uuid::Uuid;
 use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
-    CAcknowledgeBlockChange, CGameEvent, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition,
-    CRespawn, CSetContainerSlot, CSetSelectedSlot, CSystemChatMessage, GameEvent, Player,
-    PlayerAction, PlayerInfoFlags,
+    CAcknowledgeBlockChange, CGameEvent, COpenScreen, CPlayerAbilities, CPlayerInfoUpdate,
+    CPlayerPosition, CRespawn, CSetContainerSlot, CSetSelectedSlot, CSystemChatMessage, GameEvent,
+    Player, PlayerAction, PlayerInfoFlags,
 };
 use pumpkin_protocol::java::server::play::SChatMessage;
 use pumpkin_protocol::ServerPacket;
@@ -73,23 +73,20 @@ fn serialized_stack(
     Ok(bytes)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CraftingResult {
     item_id: u16,
     count: u8,
-    consumed_slots: [bool; 4],
+    consumed_slots: Vec<bool>,
 }
 
-fn crafting_result(player: &PlayerData, version: MinecraftVersion) -> Option<CraftingResult> {
+fn crafting_grid_result(
+    grid: &[Option<&'static pumpkin_data::item::Item>],
+    grid_width: usize,
+    grid_height: usize,
+) -> Option<CraftingResult> {
     use pumpkin_data::recipes::{CraftingRecipeTypes, RECIPES_CRAFTING};
 
-    let grid = std::array::from_fn::<_, 4, _>(|index| {
-        player
-            .inventory
-            .get(index + 1)
-            .and_then(|slot| inventory_stack(slot, version))
-            .map(|(item, _)| item)
-    });
     for recipe in RECIPES_CRAFTING {
         let (result, consumed_slots) = match recipe {
             CraftingRecipeTypes::CraftingShaped {
@@ -97,16 +94,18 @@ fn crafting_result(player: &PlayerData, version: MinecraftVersion) -> Option<Cra
                 pattern,
                 result,
                 ..
-            } if pattern.len() <= 2 && pattern.iter().all(|row| row.len() <= 2) => {
+            } if pattern.len() <= grid_height
+                && pattern.iter().all(|row| row.len() <= grid_width) =>
+            {
                 let mut matched = None;
                 let width = pattern.iter().map(|row| row.len()).max().unwrap_or(0);
-                for offset_y in 0..=2 - pattern.len() {
-                    for offset_x in 0..=2 - width {
+                for offset_y in 0..=grid_height - pattern.len() {
+                    for offset_x in 0..=grid_width - width {
                         for mirrored in [false, true] {
-                            let mut consumed = [false; 4];
+                            let mut consumed = vec![false; grid.len()];
                             let mut valid = true;
-                            for grid_y in 0usize..2 {
-                                for grid_x in 0usize..2 {
+                            for grid_y in 0..grid_height {
+                                for grid_x in 0..grid_width {
                                     let pattern_y = grid_y.checked_sub(offset_y);
                                     let pattern_x = grid_x.checked_sub(offset_x);
                                     let symbol = pattern_y
@@ -119,7 +118,7 @@ fn crafting_result(player: &PlayerData, version: MinecraftVersion) -> Option<Cra
                                             })
                                         })
                                         .unwrap_or(' ');
-                                    let slot = grid_y * 2 + grid_x;
+                                    let slot = grid_y * grid_width + grid_x;
                                     let expected = key.iter().find(|(key, _)| *key == symbol);
                                     let cell_matches = match (grid[slot], expected) {
                                         (None, None) if symbol == ' ' => true,
@@ -145,12 +144,12 @@ fn crafting_result(player: &PlayerData, version: MinecraftVersion) -> Option<Cra
                 ingredients,
                 result,
                 ..
-            } if ingredients.len() <= 4 => {
+            } if ingredients.len() <= grid.len() => {
                 let occupied = grid.iter().flatten().count();
                 if occupied != ingredients.len() {
                     continue;
                 }
-                let mut used = [false; 4];
+                let mut used = vec![false; grid.len()];
                 let mut valid = true;
                 for ingredient in *ingredients {
                     let Some(slot) = grid.iter().enumerate().find_map(|(slot, item)| {
@@ -179,6 +178,32 @@ fn crafting_result(player: &PlayerData, version: MinecraftVersion) -> Option<Cra
     None
 }
 
+fn crafting_result(player: &PlayerData, version: MinecraftVersion) -> Option<CraftingResult> {
+    let grid = (1..=4)
+        .map(|slot| {
+            player
+                .inventory
+                .get(slot)
+                .and_then(|stack| inventory_stack(stack, version))
+                .map(|(item, _)| item)
+        })
+        .collect::<Vec<_>>();
+    crafting_grid_result(&grid, 2, 2)
+}
+
+fn crafting_table_result(player: &PlayerData, version: MinecraftVersion) -> Option<CraftingResult> {
+    let grid = (1..=9)
+        .map(|slot| {
+            player
+                .crafting_table_inventory
+                .get(slot)
+                .and_then(|stack| inventory_stack(stack, version))
+                .map(|(item, _)| item)
+        })
+        .collect::<Vec<_>>();
+    crafting_grid_result(&grid, 3, 3)
+}
+
 fn refresh_crafting_output(
     player: &mut PlayerData,
     version: MinecraftVersion,
@@ -200,7 +225,7 @@ fn refresh_crafting_output(
 fn decrement_crafting_inputs(
     player: &mut PlayerData,
     version: MinecraftVersion,
-    consumed_slots: [bool; 4],
+    consumed_slots: Vec<bool>,
 ) -> std::io::Result<()> {
     for (grid_index, consumed) in consumed_slots.into_iter().enumerate() {
         if !consumed {
@@ -228,24 +253,38 @@ fn click_inventory_slot(
     if slot >= player.inventory.len() || slot == 0 {
         return Ok(());
     }
-    let slot_stack = player.inventory[slot].clone();
+    click_stack(
+        &mut player.carried_item,
+        &mut player.inventory[slot],
+        version,
+        button,
+    )
+}
+
+fn click_stack(
+    carried_item: &mut Vec<u8>,
+    target_slot: &mut Vec<u8>,
+    version: MinecraftVersion,
+    button: i8,
+) -> std::io::Result<()> {
+    let slot_stack = target_slot.clone();
     match (
-        inventory_stack(&player.carried_item, version),
+        inventory_stack(carried_item, version),
         inventory_stack(&slot_stack, version),
         button,
     ) {
         (None, Some((item, count)), 1) => {
             let taken = count.div_ceil(2);
-            player.carried_item = serialized_stack(item, taken, version)?;
-            player.inventory[slot] = if count > taken {
+            *carried_item = serialized_stack(item, taken, version)?;
+            *target_slot = if count > taken {
                 serialized_stack(item, count - taken, version)?
             } else {
                 Vec::new()
             };
         }
         (Some((cursor_item, cursor_count)), None, 1) => {
-            player.inventory[slot] = serialized_stack(cursor_item, 1, version)?;
-            player.carried_item = if cursor_count > 1 {
+            *target_slot = serialized_stack(cursor_item, 1, version)?;
+            *carried_item = if cursor_count > 1 {
                 serialized_stack(cursor_item, cursor_count - 1, version)?
             } else {
                 Vec::new()
@@ -256,8 +295,8 @@ fn click_inventory_slot(
         {
             let max = pumpkin_data::item_stack::ItemStack::new(1, slot_item).get_max_stack_size();
             if slot_count < max {
-                player.inventory[slot] = serialized_stack(slot_item, slot_count + 1, version)?;
-                player.carried_item = if cursor_count > 1 {
+                *target_slot = serialized_stack(slot_item, slot_count + 1, version)?;
+                *carried_item = if cursor_count > 1 {
                     serialized_stack(cursor_item, cursor_count - 1, version)?
                 } else {
                     Vec::new()
@@ -265,11 +304,11 @@ fn click_inventory_slot(
             }
         }
         (None, Some(_), _) => {
-            player.carried_item = slot_stack;
-            player.inventory[slot] = Vec::new();
+            *carried_item = slot_stack;
+            target_slot.clear();
         }
         (Some(_), None, _) => {
-            player.inventory[slot] = std::mem::take(&mut player.carried_item);
+            *target_slot = std::mem::take(carried_item);
         }
         (Some((cursor_item, cursor_count)), Some((slot_item, slot_count)), _)
             if cursor_item.id == slot_item.id =>
@@ -277,8 +316,8 @@ fn click_inventory_slot(
             let max = pumpkin_data::item_stack::ItemStack::new(1, slot_item).get_max_stack_size();
             let moved = cursor_count.min(max.saturating_sub(slot_count));
             if moved > 0 {
-                player.inventory[slot] = serialized_stack(slot_item, slot_count + moved, version)?;
-                player.carried_item = if cursor_count > moved {
+                *target_slot = serialized_stack(slot_item, slot_count + moved, version)?;
+                *carried_item = if cursor_count > moved {
                     serialized_stack(cursor_item, cursor_count - moved, version)?
                 } else {
                     Vec::new()
@@ -286,8 +325,8 @@ fn click_inventory_slot(
             }
         }
         (Some(_), Some(_), _) => {
-            player.inventory[slot] = std::mem::take(&mut player.carried_item);
-            player.carried_item = slot_stack;
+            *target_slot = std::mem::take(carried_item);
+            *carried_item = slot_stack;
         }
         _ => {}
     }
@@ -356,6 +395,113 @@ fn take_crafting_output_to_inventory(
     refresh_crafting_output(player, version)
 }
 
+fn refresh_crafting_table_output(
+    player: &mut PlayerData,
+    version: MinecraftVersion,
+) -> std::io::Result<()> {
+    player.crafting_table_inventory[0] =
+        if let Some(result) = crafting_table_result(player, version) {
+            let item = pumpkin_data::item::Item::from_id(result.item_id).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "crafting-table result item is missing",
+                )
+            })?;
+            serialized_stack(item, result.count, version)?
+        } else {
+            Vec::new()
+        };
+    Ok(())
+}
+
+fn decrement_crafting_table_inputs(
+    player: &mut PlayerData,
+    version: MinecraftVersion,
+    consumed_slots: Vec<bool>,
+) -> std::io::Result<()> {
+    for (grid_index, consumed) in consumed_slots.into_iter().enumerate() {
+        if !consumed {
+            continue;
+        }
+        let slot = grid_index + 1;
+        let Some((item, count)) = inventory_stack(&player.crafting_table_inventory[slot], version)
+        else {
+            continue;
+        };
+        player.crafting_table_inventory[slot] = if count > 1 {
+            serialized_stack(item, count - 1, version)?
+        } else {
+            Vec::new()
+        };
+    }
+    Ok(())
+}
+
+fn take_crafting_table_output(
+    player: &mut PlayerData,
+    version: MinecraftVersion,
+) -> std::io::Result<()> {
+    let Some(result) = crafting_table_result(player, version) else {
+        return Ok(());
+    };
+    let item = pumpkin_data::item::Item::from_id(result.item_id).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "crafting-table result item is missing",
+        )
+    })?;
+    let new_count = match inventory_stack(&player.carried_item, version) {
+        None => result.count,
+        Some((cursor_item, cursor_count)) if cursor_item.id == result.item_id => {
+            let max = pumpkin_data::item_stack::ItemStack::new(1, item).get_max_stack_size();
+            let Some(total) = cursor_count
+                .checked_add(result.count)
+                .filter(|count| *count <= max)
+            else {
+                return Ok(());
+            };
+            total
+        }
+        Some(_) => return Ok(()),
+    };
+    player.carried_item = serialized_stack(item, new_count, version)?;
+    decrement_crafting_table_inputs(player, version, result.consumed_slots)?;
+    refresh_crafting_table_output(player, version)
+}
+
+fn take_crafting_table_output_to_inventory(
+    player: &mut PlayerData,
+    version: MinecraftVersion,
+) -> std::io::Result<()> {
+    let Some(result) = crafting_table_result(player, version) else {
+        return Ok(());
+    };
+    let item = pumpkin_data::item::Item::from_id(result.item_id).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "crafting-table result item is missing",
+        )
+    })?;
+    let max = pumpkin_data::item_stack::ItemStack::new(1, item).get_max_stack_size();
+    let destination = (36..45).chain(9..36).find_map(|slot| {
+        match inventory_stack(&player.inventory[slot], version) {
+            Some((existing, count))
+                if existing.id == item.id && count.saturating_add(result.count) <= max =>
+            {
+                Some((slot, count + result.count))
+            }
+            None => Some((slot, result.count)),
+            _ => None,
+        }
+    });
+    let Some((slot, count)) = destination else {
+        return Ok(());
+    };
+    player.inventory[slot] = serialized_stack(item, count, version)?;
+    decrement_crafting_table_inputs(player, version, result.consumed_slots)?;
+    refresh_crafting_table_output(player, version)
+}
+
 async fn send_inventory_content(
     stream: &mut TcpStream,
     version: MinecraftVersion,
@@ -385,6 +531,88 @@ async fn send_inventory_content(
     );
     packet.extend_from_slice(&payload);
     write_framed_payload(stream, packet.as_slice()).await
+}
+
+async fn send_crafting_table_content(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    player: &PlayerData,
+    revision: i32,
+) -> std::io::Result<()> {
+    let mut slots = Vec::with_capacity(46);
+    slots.extend(player.crafting_table_inventory.iter().cloned());
+    slots.extend(player.inventory[9..36].iter().cloned());
+    slots.extend(player.inventory[36..45].iter().cloned());
+
+    let mut payload = Vec::new();
+    write_varint(&mut payload, player.open_container_id);
+    write_varint(&mut payload, revision);
+    write_varint(&mut payload, slots.len() as i32);
+    for slot in &slots {
+        if slot.is_empty() {
+            write_varint(&mut payload, 0);
+        } else {
+            payload.extend_from_slice(slot);
+        }
+    }
+    if player.carried_item.is_empty() {
+        write_varint(&mut payload, 0);
+    } else {
+        payload.extend_from_slice(&player.carried_item);
+    }
+    let mut packet = Vec::new();
+    write_varint(
+        &mut packet,
+        pumpkin_data::packet::clientbound::PLAY_CONTAINER_SET_CONTENT.to_id(version),
+    );
+    packet.extend_from_slice(&payload);
+    write_framed_payload(stream, packet.as_slice()).await
+}
+
+async fn open_crafting_table(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    player: &mut PlayerData,
+) -> std::io::Result<()> {
+    player.open_container_id = 1;
+    refresh_crafting_table_output(player, version)?;
+    let title = TextComponent::translate("container.crafting".to_owned(), &[]);
+    let packet = COpenScreen::new(
+        VarInt(player.open_container_id),
+        VarInt(pumpkin_data::screen::WindowType::Crafting as i32),
+        &title,
+    );
+    let payload = encode_java_packet(&packet, version)?;
+    write_framed_payload(stream, payload.as_slice()).await?;
+    send_crafting_table_content(stream, version, player, 0).await
+}
+
+async fn close_crafting_table(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    player: &mut PlayerData,
+) -> std::io::Result<()> {
+    for slot in 1..=9 {
+        let stack = std::mem::take(&mut player.crafting_table_inventory[slot]);
+        let Some((item, count)) = inventory_stack(&stack, version) else {
+            continue;
+        };
+        if !store_inventory_item(stream, version, player, item.id, count).await? {
+            spawn_dropped_item(
+                item.id,
+                count,
+                player.x,
+                player.y + 1.0,
+                player.z,
+                0.0,
+                0.1,
+                0.0,
+            );
+        }
+    }
+    player.crafting_table_inventory[0].clear();
+    player.open_container_id = 0;
+    Ok(())
 }
 
 fn held_inventory_slot(player: &PlayerData, hand: i32) -> Option<usize> {
@@ -533,6 +761,7 @@ pub async fn handle_play_packet(
     let sv_interact = pumpkin_data::packet::serverbound::PLAY_INTERACT.to_id(version);
     let sv_pick_block = pumpkin_data::packet::serverbound::PLAY_PICK_ITEM_FROM_BLOCK.to_id(version);
     let sv_container_click = pumpkin_data::packet::serverbound::PLAY_CONTAINER_CLICK.to_id(version);
+    let sv_container_close = pumpkin_data::packet::serverbound::PLAY_CONTAINER_CLOSE.to_id(version);
 
     let mut moved = false;
 
@@ -553,7 +782,10 @@ pub async fn handle_play_packet(
                 _ => (x, y + 1, z),
             };
 
-            if let Some(block_id) = held_block_state(player, pkt.hand.0, version) {
+            let clicked_block = pumpkin_data::Block::from_state_id(get_block_state(db, x, y, z));
+            if clicked_block == &pumpkin_data::Block::CRAFTING_TABLE {
+                open_crafting_table(stream, version, player).await?;
+            } else if let Some(block_id) = held_block_state(player, pkt.hand.0, version) {
                 save_block_change(db, nx, ny, nz, block_id);
                 let _ = block_channel().send(BlockUpdateEvent {
                     x: nx,
@@ -597,6 +829,42 @@ pub async fn handle_play_packet(
                     _ => {}
                 }
                 send_inventory_content(stream, version, player, packet.revision.0 + 1).await?;
+            } else if packet.sync_id.0 == player.open_container_id {
+                match packet.mode {
+                    SlotActionType::Pickup if packet.slot == 0 => {
+                        take_crafting_table_output(player, version)?;
+                    }
+                    SlotActionType::Pickup if (1..=9).contains(&packet.slot) => {
+                        let slot = packet.slot as usize;
+                        click_stack(
+                            &mut player.carried_item,
+                            &mut player.crafting_table_inventory[slot],
+                            version,
+                            packet.button,
+                        )?;
+                        refresh_crafting_table_output(player, version)?;
+                    }
+                    SlotActionType::Pickup if (10..=45).contains(&packet.slot) => {
+                        let inventory_slot = if packet.slot <= 36 {
+                            9 + (packet.slot as usize - 10)
+                        } else {
+                            36 + (packet.slot as usize - 37)
+                        };
+                        click_inventory_slot(player, version, inventory_slot, packet.button)?;
+                    }
+                    SlotActionType::QuickMove if packet.slot == 0 => {
+                        take_crafting_table_output_to_inventory(player, version)?;
+                    }
+                    _ => {}
+                }
+                send_crafting_table_content(stream, version, player, packet.revision.0 + 1).await?;
+            }
+        }
+    } else if pid == sv_container_close {
+        use pumpkin_protocol::java::server::play::SCloseContainer;
+        if let Ok(packet) = SCloseContainer::read(&mut std::io::Cursor::new(payload), &version) {
+            if packet.window_id.0 == player.open_container_id && player.open_container_id != 0 {
+                close_crafting_table(stream, version, player).await?;
             }
         }
     } else if pid == sv_pick_block && sv_pick_block >= 0 {
@@ -1323,5 +1591,31 @@ mod tests {
         assert!(player.inventory[1].is_empty());
         assert!(player.inventory[3].is_empty());
         assert!(player.inventory[0].is_empty());
+    }
+
+    #[test]
+    fn crafting_table_supports_three_by_three_recipes() {
+        let version = MinecraftVersion::V_26_1;
+        let mut player = PlayerData::default();
+        for slot in 1..=9 {
+            if slot != 5 {
+                player.crafting_table_inventory[slot] =
+                    serialized_stack(&pumpkin_data::item::Item::COBBLESTONE, 1, version).unwrap();
+            }
+        }
+
+        assert_eq!(
+            crafting_table_result(&player, version).map(|result| (result.item_id, result.count)),
+            Some((pumpkin_data::item::Item::FURNACE.id, 1))
+        );
+
+        take_crafting_table_output(&mut player, version).unwrap();
+        assert_eq!(
+            inventory_stack(&player.carried_item, version).map(|(item, count)| (item.id, count)),
+            Some((pumpkin_data::item::Item::FURNACE.id, 1))
+        );
+        assert!(player.crafting_table_inventory[1..]
+            .iter()
+            .all(Vec::is_empty));
     }
 }

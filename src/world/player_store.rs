@@ -16,6 +16,12 @@ pub struct PlayerData {
     /// Runtime cursor stack used by container clicks; never persisted.
     #[serde(skip)]
     pub carried_item: Vec<u8>,
+    /// Runtime crafting-table slots (output followed by the 3x3 input grid).
+    #[serde(skip, default = "default_crafting_table_inventory")]
+    pub crafting_table_inventory: Vec<Vec<u8>>,
+    /// Active non-player container ID, or zero when only the player inventory is open.
+    #[serde(skip)]
+    pub open_container_id: i32,
     #[serde(default)]
     pub highest_y: f64,
     #[serde(default)]
@@ -31,6 +37,10 @@ fn default_health() -> f32 {
     20.0
 }
 
+fn default_crafting_table_inventory() -> Vec<Vec<u8>> {
+    vec![Vec::new(); 10]
+}
+
 impl Default for PlayerData {
     fn default() -> Self {
         Self {
@@ -42,6 +52,8 @@ impl Default for PlayerData {
             gamemode: 0, // new players start in survival
             inventory: vec![Vec::new(); 46],
             carried_item: Vec::new(),
+            crafting_table_inventory: default_crafting_table_inventory(),
+            open_container_id: 0,
             highest_y: 70.0,
             held_slot: 0,
             health: 20.0,
@@ -95,6 +107,8 @@ mod tests {
         assert_eq!((loaded.yaw, loaded.pitch), (123.0, -42.5));
         assert_eq!(loaded.inventory[36], vec![1, 2, 3, 4]);
         assert_eq!(loaded.operator_level, 0);
+        assert_eq!(loaded.crafting_table_inventory.len(), 10);
+        assert_eq!(loaded.open_container_id, 0);
     }
 
     #[test]
