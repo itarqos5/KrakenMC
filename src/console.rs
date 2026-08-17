@@ -3,7 +3,7 @@ use std::io::{self, BufRead};
 use crate::logger::{log_error, log_info, log_warn};
 use crate::operator_store::{remove_operator, set_operator};
 use crate::viakraken::java::backend::state::{
-    console_command_channel, online_players, ConsoleCommand, OnlinePlayer,
+    console_command_channel, online_players, ConsoleCommand, OnlinePlayer, NEXT_ENTITY_ID,
 };
 
 pub fn spawn_console() {
@@ -82,6 +82,45 @@ fn execute(input: &str) {
             };
             send_to_player(parts[2], |uuid| ConsoleCommand::Gamemode { uuid, gamemode });
         }
+        "summon" if parts.len() == 2 || parts.len() == 5 => {
+            let entity_name = parts[1].strip_prefix("minecraft:").unwrap_or(parts[1]);
+            let Some(entity_type) = pumpkin_data::entity::EntityType::from_name(entity_name) else {
+                log_warn!("Unknown entity type '{}'.", parts[1]);
+                return;
+            };
+            if !entity_type.summonable || entity_type == &pumpkin_data::entity::EntityType::PLAYER {
+                log_warn!("Entity '{}' cannot be summoned.", entity_name);
+                return;
+            }
+            let coordinates = if parts.len() == 5 {
+                let parsed = parts[2..5]
+                    .iter()
+                    .map(|value| value.parse::<f64>())
+                    .collect::<Result<Vec<_>, _>>();
+                let Ok(values) = parsed else {
+                    log_warn!("Summon coordinates must be numbers.");
+                    return;
+                };
+                (values[0], values[1], values[2])
+            } else {
+                (0.5, 70.0, 0.5)
+            };
+            let entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = console_command_channel().send(ConsoleCommand::Summon {
+                entity_id,
+                entity_type: entity_type.id,
+                x: coordinates.0,
+                y: coordinates.1,
+                z: coordinates.2,
+            });
+            log_info!(
+                "Summoned {} at {:.1}, {:.1}, {:.1}.",
+                entity_name,
+                coordinates.0,
+                coordinates.1,
+                coordinates.2
+            );
+        }
         _ => log_warn!("Unknown or incomplete command. Type /help for usage."),
     }
 }
@@ -143,6 +182,7 @@ fn print_help() {
     log_info!("  /deop <player>                Remove operator status");
     log_info!("  /kill <player>                Kill an online player");
     log_info!("  /gamemode <mode> <player>     Set survival/creative/adventure/spectator");
+    log_info!("  /summon <entity> [x y z]      Summon an entity (default: 0.5 70 0.5)");
 }
 
 #[cfg(test)]
@@ -154,5 +194,12 @@ mod tests {
         assert_eq!(parse_gamemode("creative"), Some(1));
         assert_eq!(parse_gamemode("3"), Some(3));
         assert_eq!(parse_gamemode("invalid"), None);
+    }
+
+    #[test]
+    fn entity_registry_resolves_summon_names() {
+        let zombie = pumpkin_data::entity::EntityType::from_name("zombie").unwrap();
+        assert!(zombie.summonable);
+        assert_eq!(zombie.resource_name, "zombie");
     }
 }

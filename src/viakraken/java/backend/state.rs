@@ -100,9 +100,24 @@ pub static NEXT_ENTITY_ID: AtomicI32 = AtomicI32::new(1);
 
 #[derive(Clone, Debug)]
 pub enum ConsoleCommand {
-    OperatorLevel { uuid: Uuid, level: u8 },
-    Kill { uuid: Uuid },
-    Gamemode { uuid: Uuid, gamemode: u8 },
+    OperatorLevel {
+        uuid: Uuid,
+        level: u8,
+    },
+    Kill {
+        uuid: Uuid,
+    },
+    Gamemode {
+        uuid: Uuid,
+        gamemode: u8,
+    },
+    Summon {
+        entity_id: i32,
+        entity_type: u16,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
 }
 
 pub fn console_command_channel() -> &'static tokio::sync::broadcast::Sender<ConsoleCommand> {

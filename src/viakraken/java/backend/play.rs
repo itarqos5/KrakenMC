@@ -486,6 +486,25 @@ pub async fn handle_play(
                         change_gamemode(stream, version, &mut player, uuid, gamemode).await?;
                         log_info!("Set {} to game mode {} from the console.", username, gamemode);
                     }
+                    ConsoleCommand::Summon { entity_id, entity_type, x, y, z } => {
+                        let network_entity_type = pumpkin_data::entity_id_remap::remap_entity_id_for_version(
+                            entity_type,
+                            version,
+                        );
+                        let packet = CSpawnEntity::new(
+                            VarInt(entity_id),
+                            Uuid::new_v4(),
+                            VarInt(network_entity_type as i32),
+                            Vector3 { x, y, z },
+                            0.0,
+                            0.0,
+                            0.0,
+                            VarInt(0),
+                            Vector3::new(0.0, 0.0, 0.0),
+                        );
+                        let payload = encode_java_packet(&packet, version)?;
+                        write_framed_payload(stream, payload.as_slice()).await?;
+                    }
                     _ => {}
                 }
             }
