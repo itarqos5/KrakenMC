@@ -9,7 +9,7 @@ use noise::{NoiseFn, Perlin};
 use pumpkin_util::version::MinecraftVersion;
 use serde::{Deserialize, Serialize};
 
-const CHUNK_FORMAT_VERSION: u8 = 1;
+const CHUNK_FORMAT_VERSION: u8 = 2;
 const SECTION_COUNT: usize = 24;
 const MIN_Y: i32 = -64;
 const MAX_Y: i32 = 319;
@@ -35,6 +35,7 @@ pub struct SavedChunk {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerrainBiome {
+    Ocean,
     SnowyPlains,
     Taiga,
     Forest,
@@ -59,6 +60,7 @@ struct BlockPosition {
 impl TerrainBiome {
     fn protocol_id(self) -> u8 {
         match self {
+            Self::Ocean => pumpkin_data::biome::Biome::OCEAN.id,
             Self::SnowyPlains => pumpkin_data::biome::Biome::SNOWY_PLAINS.id,
             Self::Taiga => pumpkin_data::biome::Biome::TAIGA.id,
             Self::Forest => pumpkin_data::biome::Biome::FOREST.id,
@@ -70,6 +72,7 @@ impl TerrainBiome {
 
     fn tree_density(self) -> u64 {
         match self {
+            Self::Ocean => 0,
             Self::Forest => 72,
             Self::Taiga => 58,
             Self::Plains => 12,
@@ -307,16 +310,34 @@ fn surface_height_at(
     biome: TerrainBiome,
     terrain_noise: &Perlin,
 ) -> i32 {
-    let broad = terrain_noise.get([world_x as f64 / 180.0, world_z as f64 / 180.0]);
-    let detail = terrain_noise.get([world_x as f64 / 42.0, world_z as f64 / 42.0]);
+    // Vanilla separates terrain shape from biome selection. These bands approximate its
+    // continentalness, erosion, ridge and detail density functions while remaining cheap enough
+    // for synchronous chunk snapshots.
+    let continentalness = terrain_noise.get([world_x as f64 / 720.0, world_z as f64 / 720.0]);
+    let erosion = terrain_noise.get([world_x as f64 / 260.0 + 91.0, world_z as f64 / 260.0 - 37.0]);
+    let ridge_sample = terrain_noise.get([
+        world_x as f64 / 145.0 - 113.0,
+        world_z as f64 / 145.0 + 67.0,
+    ]);
+    let ridges = (1.0 - ridge_sample.abs()).powi(3);
+    let detail = terrain_noise.get([world_x as f64 / 48.0, world_z as f64 / 48.0]);
     let biome_offset = match biome {
+        TerrainBiome::Ocean => -2.0,
         TerrainBiome::Taiga => 3.0,
         TerrainBiome::Forest => 2.0,
         TerrainBiome::Savanna => 1.0,
         TerrainBiome::Desert => -1.0,
         TerrainBiome::SnowyPlains | TerrainBiome::Plains => 0.0,
     };
-    (67.0 + biome_offset + broad * 13.0 + detail * 3.0).round() as i32
+    let ocean_depth = if continentalness < -0.12 {
+        (continentalness + 0.12) * 45.0
+    } else {
+        0.0
+    };
+    let mountain_height = ((continentalness + 0.08).max(0.0) * ridges * 58.0)
+        * (1.0 - erosion * 0.35).clamp(0.45, 1.35);
+    (63.0 + biome_offset + continentalness * 31.0 + ocean_depth + mountain_height + detail * 3.5)
+        .round() as i32
 }
 
 fn coordinate_hash(seed: i64, x: i32, y: i32, z: i32) -> u64 {
@@ -331,55 +352,164 @@ fn coordinate_hash(seed: i64, x: i32, y: i32, z: i32) -> u64 {
     value ^ (value >> 31)
 }
 
-fn ore_state(seed: i64, world_x: i32, y: i32, world_z: i32, base_state: u16) -> u16 {
-    let roll = coordinate_hash(seed, world_x, y, world_z) % 10_000;
-    let deep = y < 0;
-    let block = if y < 16 && roll < 10 {
-        if deep {
-            &pumpkin_data::Block::DEEPSLATE_DIAMOND_ORE
-        } else {
-            &pumpkin_data::Block::DIAMOND_ORE
+struct OreVein {
+    salt: i64,
+    attempts: i32,
+    min_y: i32,
+    max_y: i32,
+    radius: i32,
+    stone_ore: u16,
+    deepslate_ore: u16,
+}
+
+fn add_contextual_ore_veins(chunk: &mut SavedChunk, chunk_x: i32, chunk_z: i32, seed: i64) {
+    let veins = [
+        OreVein {
+            salt: 0x434f_414c,
+            attempts: 4,
+            min_y: 0,
+            max_y: 128,
+            radius: 1,
+            stone_ore: pumpkin_data::Block::COAL_ORE.default_state.id,
+            deepslate_ore: pumpkin_data::Block::DEEPSLATE_COAL_ORE.default_state.id,
+        },
+        OreVein {
+            salt: 0x434f_5050,
+            attempts: 3,
+            min_y: 0,
+            max_y: 96,
+            radius: 2,
+            stone_ore: pumpkin_data::Block::COPPER_ORE.default_state.id,
+            deepslate_ore: pumpkin_data::Block::DEEPSLATE_COPPER_ORE.default_state.id,
+        },
+        OreVein {
+            salt: 0x4952_4f4e,
+            attempts: 4,
+            min_y: -56,
+            max_y: 72,
+            radius: 1,
+            stone_ore: pumpkin_data::Block::IRON_ORE.default_state.id,
+            deepslate_ore: pumpkin_data::Block::DEEPSLATE_IRON_ORE.default_state.id,
+        },
+        OreVein {
+            salt: 0x474f_4c44,
+            attempts: 2,
+            min_y: -56,
+            max_y: 32,
+            radius: 1,
+            stone_ore: pumpkin_data::Block::GOLD_ORE.default_state.id,
+            deepslate_ore: pumpkin_data::Block::DEEPSLATE_GOLD_ORE.default_state.id,
+        },
+        OreVein {
+            salt: 0x4c41_5049,
+            attempts: 1,
+            min_y: -32,
+            max_y: 32,
+            radius: 1,
+            stone_ore: pumpkin_data::Block::LAPIS_ORE.default_state.id,
+            deepslate_ore: pumpkin_data::Block::DEEPSLATE_LAPIS_ORE.default_state.id,
+        },
+        OreVein {
+            salt: 0x5245_4453,
+            attempts: 2,
+            min_y: -60,
+            max_y: 16,
+            radius: 1,
+            stone_ore: pumpkin_data::Block::REDSTONE_ORE.default_state.id,
+            deepslate_ore: pumpkin_data::Block::DEEPSLATE_REDSTONE_ORE.default_state.id,
+        },
+        OreVein {
+            salt: 0x4449_414d,
+            attempts: 2,
+            min_y: -60,
+            max_y: 12,
+            radius: 1,
+            stone_ore: pumpkin_data::Block::DIAMOND_ORE.default_state.id,
+            deepslate_ore: pumpkin_data::Block::DEEPSLATE_DIAMOND_ORE.default_state.id,
+        },
+    ];
+
+    for vein in &veins {
+        for source_z in chunk_z - 1..=chunk_z + 1 {
+            for source_x in chunk_x - 1..=chunk_x + 1 {
+                for attempt in 0..vein.attempts {
+                    let hash = coordinate_hash(seed ^ vein.salt, source_x, attempt, source_z);
+                    let span = (vein.max_y - vein.min_y + 1) as u64;
+                    let origin = BlockPosition {
+                        x: source_x * 16 + (hash & 15) as i32,
+                        y: vein.min_y + ((hash >> 8) % span) as i32,
+                        z: source_z * 16 + ((hash >> 24) & 15) as i32,
+                    };
+                    let direction_x = ((hash >> 40) % 3) as i32 - 1;
+                    let direction_y = ((hash >> 44) % 3) as i32 - 1;
+                    let direction_z = ((hash >> 48) % 3) as i32 - 1;
+                    let length = 2 + ((hash >> 52) % 4) as i32;
+                    for step in 0..length {
+                        place_ore_blob(
+                            chunk,
+                            ChunkPosition {
+                                x: chunk_x,
+                                z: chunk_z,
+                            },
+                            BlockPosition {
+                                x: origin.x + direction_x * step,
+                                y: origin.y + direction_y * step / 2,
+                                z: origin.z + direction_z * step,
+                            },
+                            vein,
+                            hash.wrapping_add(step as u64),
+                        );
+                    }
+                }
+            }
         }
-    } else if y < 16 && roll < 32 {
-        if deep {
-            &pumpkin_data::Block::DEEPSLATE_REDSTONE_ORE
-        } else {
-            &pumpkin_data::Block::REDSTONE_ORE
+    }
+}
+
+fn place_ore_blob(
+    chunk: &mut SavedChunk,
+    target_chunk: ChunkPosition,
+    center: BlockPosition,
+    vein: &OreVein,
+    hash: u64,
+) {
+    let stone = pumpkin_data::Block::STONE.default_state.id;
+    let deepslate = pumpkin_data::Block::DEEPSLATE.default_state.id;
+    for dy in -vein.radius..=vein.radius {
+        for dz in -vein.radius..=vein.radius {
+            for dx in -vein.radius..=vein.radius {
+                if dx * dx + dy * dy + dz * dz > vein.radius * vein.radius + 1 {
+                    continue;
+                }
+                let position = BlockPosition {
+                    x: center.x + dx,
+                    y: center.y + dy,
+                    z: center.z + dz,
+                };
+                if position.x >> 4 != target_chunk.x || position.z >> 4 != target_chunk.z {
+                    continue;
+                }
+                let Some(index) = block_index(
+                    (position.x & 15) as usize,
+                    position.y,
+                    (position.z & 15) as usize,
+                ) else {
+                    continue;
+                };
+                let base = chunk.blocks[index];
+                if (base == stone || base == deepslate)
+                    && !coordinate_hash(hash as i64, position.x, position.y, position.z)
+                        .is_multiple_of(5)
+                {
+                    chunk.blocks[index] = if base == deepslate {
+                        vein.deepslate_ore
+                    } else {
+                        vein.stone_ore
+                    };
+                }
+            }
         }
-    } else if y < 32 && roll < 48 {
-        if deep {
-            &pumpkin_data::Block::DEEPSLATE_GOLD_ORE
-        } else {
-            &pumpkin_data::Block::GOLD_ORE
-        }
-    } else if (-32..=32).contains(&y) && roll < 68 {
-        if deep {
-            &pumpkin_data::Block::DEEPSLATE_LAPIS_ORE
-        } else {
-            &pumpkin_data::Block::LAPIS_ORE
-        }
-    } else if y < 72 && roll < 125 {
-        if deep {
-            &pumpkin_data::Block::DEEPSLATE_IRON_ORE
-        } else {
-            &pumpkin_data::Block::IRON_ORE
-        }
-    } else if (0..=96).contains(&y) && roll < 165 {
-        if deep {
-            &pumpkin_data::Block::DEEPSLATE_COPPER_ORE
-        } else {
-            &pumpkin_data::Block::COPPER_ORE
-        }
-    } else if y < 128 && roll < 235 {
-        if deep {
-            &pumpkin_data::Block::DEEPSLATE_COAL_ORE
-        } else {
-            &pumpkin_data::Block::COAL_ORE
-        }
-    } else {
-        return base_state;
-    };
-    block.default_state.id
+    }
 }
 
 fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
@@ -388,6 +518,7 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
     let moisture_noise = Perlin::new((seed as u32).wrapping_add(0xa913));
     let cave_noise = Perlin::new((seed as u32).wrapping_add(0x37c1));
     let tunnel_noise = Perlin::new((seed as u32).wrapping_add(0x8d21));
+    let noodle_noise = Perlin::new((seed as u32).wrapping_add(0x6b43));
 
     let air = pumpkin_data::Block::AIR.default_state.id;
     let bedrock = pumpkin_data::Block::BEDROCK.default_state.id;
@@ -398,6 +529,8 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
     let sand = pumpkin_data::Block::SAND.default_state.id;
     let sandstone = pumpkin_data::Block::SANDSTONE.default_state.id;
     let snow = pumpkin_data::Block::SNOW.default_state.id;
+    let water = pumpkin_data::Block::WATER.default_state.id;
+    const SEA_LEVEL: i32 = 63;
 
     let mut chunk = SavedChunk {
         format_version: CHUNK_FORMAT_VERSION,
@@ -411,9 +544,15 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
         for local_x in 0..CHUNK_WIDTH {
             let world_x = chunk_x * 16 + local_x as i32;
             let world_z = chunk_z * 16 + local_z as i32;
-            let (biome, temperature) =
+            let (climate_biome, temperature) =
                 climate_at(world_x, world_z, &temperature_noise, &moisture_noise);
-            let surface = surface_height_at(world_x, world_z, biome, &terrain_noise).clamp(48, 110);
+            let surface =
+                surface_height_at(world_x, world_z, climate_biome, &terrain_noise).clamp(34, 180);
+            let biome = if surface < SEA_LEVEL - 2 {
+                TerrainBiome::Ocean
+            } else {
+                climate_biome
+            };
             let column = column_index(local_x, local_z);
             chunk.biomes[column] = biome.protocol_id();
             chunk.temperatures[column] = (temperature * 1000.0).round() as i16;
@@ -427,12 +566,12 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
                     bedrock
                 } else if y == surface {
                     match biome {
-                        TerrainBiome::Desert => sand,
+                        TerrainBiome::Desert | TerrainBiome::Ocean => sand,
                         _ => grass,
                     }
                 } else if y >= surface - 3 {
                     match biome {
-                        TerrainBiome::Desert => {
+                        TerrainBiome::Desert | TerrainBiome::Ocean => {
                             if y == surface - 3 {
                                 sandstone
                             } else {
@@ -453,13 +592,21 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
                         y as f64 / 19.0,
                         world_z as f64 / 57.0,
                     ]);
+                    let cave_c = noodle_noise.get([
+                        world_x as f64 / 38.0 - 17.0,
+                        y as f64 / 27.0 + 41.0,
+                        world_z as f64 / 38.0 + 23.0,
+                    ]);
+                    let cheese_cave = y < 48 && cave_a > 0.69;
+                    let spaghetti_cave = cave_a.abs() < 0.105 && cave_b.abs() < 0.09;
+                    let noodle_cave = y < 34 && cave_b.abs() < 0.055 && cave_c.abs() < 0.052;
                     let is_cave = y > MIN_Y + 5
                         && y < surface - 5
-                        && (cave_a.abs() > 0.64 || (cave_a.abs() > 0.48 && cave_b.abs() < 0.09));
+                        && (cheese_cave || spaghetti_cave || noodle_cave);
                     if is_cave {
                         air
                     } else {
-                        ore_state(seed, world_x, y, world_z, base)
+                        base
                     }
                 };
                 if let Some(index) = block_index(local_x, y, local_z) {
@@ -467,13 +614,24 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
                 }
             }
 
-            if biome == TerrainBiome::SnowyPlains && surface < MAX_Y {
+            if surface < SEA_LEVEL {
+                for y in surface + 1..=SEA_LEVEL {
+                    if let Some(index) = block_index(local_x, y, local_z) {
+                        chunk.blocks[index] = water;
+                    }
+                }
+            }
+
+            if biome == TerrainBiome::SnowyPlains && surface >= SEA_LEVEL && surface < MAX_Y {
                 if let Some(index) = block_index(local_x, surface + 1, local_z) {
                     chunk.blocks[index] = snow;
                 }
             }
         }
     }
+
+    seal_isolated_cave_pockets(&mut chunk);
+    add_contextual_ore_veins(&mut chunk, chunk_x, chunk_z, seed);
 
     add_contextual_trees(
         &mut chunk,
@@ -484,7 +642,47 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
         &temperature_noise,
         &moisture_noise,
     );
+    add_contextual_structures(
+        &mut chunk,
+        chunk_x,
+        chunk_z,
+        seed,
+        &terrain_noise,
+        &temperature_noise,
+        &moisture_noise,
+    );
     chunk
+}
+
+fn seal_isolated_cave_pockets(chunk: &mut SavedChunk) {
+    let air = pumpkin_data::Block::AIR.default_state.id;
+    let stone = pumpkin_data::Block::STONE.default_state.id;
+    let deepslate = pumpkin_data::Block::DEEPSLATE.default_state.id;
+    let original = chunk.blocks.clone();
+    for y in MIN_Y + 1..MAX_Y {
+        for z in 1..15 {
+            for x in 1..15 {
+                let index = block_index(x, y, z).unwrap();
+                if original[index] != air || y >= chunk.surface_y[column_index(x, z)] as i32 - 5 {
+                    continue;
+                }
+                let neighbors = [
+                    (x - 1, y, z),
+                    (x + 1, y, z),
+                    (x, y - 1, z),
+                    (x, y + 1, z),
+                    (x, y, z - 1),
+                    (x, y, z + 1),
+                ];
+                if neighbors
+                    .iter()
+                    .all(|(nx, ny, nz)| original[block_index(*nx, *ny, *nz).unwrap()] != air)
+                {
+                    chunk.blocks[index] = if y < 0 { deepslate } else { stone };
+                }
+            }
+        }
+    }
 }
 
 fn add_contextual_trees(
@@ -507,7 +705,10 @@ fn add_contextual_trees(
                     continue;
                 }
                 let surface =
-                    surface_height_at(world_x, world_z, biome, terrain_noise).clamp(48, 110);
+                    surface_height_at(world_x, world_z, biome, terrain_noise).clamp(34, 180);
+                if surface < 63 {
+                    continue;
+                }
                 place_tree(
                     chunk,
                     ChunkPosition {
@@ -604,6 +805,144 @@ fn place_tree(
                     true,
                 );
             }
+        }
+    }
+}
+
+fn add_contextual_structures(
+    chunk: &mut SavedChunk,
+    chunk_x: i32,
+    chunk_z: i32,
+    seed: i64,
+    terrain_noise: &Perlin,
+    temperature_noise: &Perlin,
+    moisture_noise: &Perlin,
+) {
+    const REGION_SIZE: i32 = 10;
+    let target_region_x = chunk_x.div_euclid(REGION_SIZE);
+    let target_region_z = chunk_z.div_euclid(REGION_SIZE);
+    for region_z in target_region_z - 1..=target_region_z + 1 {
+        for region_x in target_region_x - 1..=target_region_x + 1 {
+            let hash = coordinate_hash(seed ^ 0x5354_5255_4354, region_x, 0, region_z);
+            if !hash.is_multiple_of(3) {
+                continue;
+            }
+            let source_chunk_x = region_x * REGION_SIZE + ((hash >> 8) % REGION_SIZE as u64) as i32;
+            let source_chunk_z =
+                region_z * REGION_SIZE + ((hash >> 20) % REGION_SIZE as u64) as i32;
+            let world_x = source_chunk_x * 16 + 8;
+            let world_z = source_chunk_z * 16 + 8;
+            let (biome, _) = climate_at(world_x, world_z, temperature_noise, moisture_noise);
+            if matches!(biome, TerrainBiome::Desert | TerrainBiome::SnowyPlains) {
+                continue;
+            }
+            let surface = surface_height_at(world_x, world_z, biome, terrain_noise).clamp(34, 180);
+            if surface < 63 {
+                continue;
+            }
+            place_cabin(
+                chunk,
+                ChunkPosition {
+                    x: chunk_x,
+                    z: chunk_z,
+                },
+                BlockPosition {
+                    x: world_x,
+                    y: surface,
+                    z: world_z,
+                },
+            );
+        }
+    }
+}
+
+fn set_structure_block(
+    chunk: &mut SavedChunk,
+    target_chunk: ChunkPosition,
+    position: BlockPosition,
+    state: u16,
+) {
+    if position.x >> 4 != target_chunk.x || position.z >> 4 != target_chunk.z {
+        return;
+    }
+    let Some(index) = block_index(
+        (position.x & 15) as usize,
+        position.y,
+        (position.z & 15) as usize,
+    ) else {
+        return;
+    };
+    chunk.blocks[index] = state;
+}
+
+fn place_cabin(chunk: &mut SavedChunk, target_chunk: ChunkPosition, center: BlockPosition) {
+    let cobblestone = pumpkin_data::Block::COBBLESTONE.default_state.id;
+    let planks = pumpkin_data::Block::OAK_PLANKS.default_state.id;
+    let logs = pumpkin_data::Block::OAK_LOG.default_state.id;
+    let air = pumpkin_data::Block::AIR.default_state.id;
+
+    for dz in -3i32..=3 {
+        for dx in -3i32..=3 {
+            set_structure_block(
+                chunk,
+                target_chunk,
+                BlockPosition {
+                    x: center.x + dx,
+                    y: center.y - 1,
+                    z: center.z + dz,
+                },
+                cobblestone,
+            );
+            set_structure_block(
+                chunk,
+                target_chunk,
+                BlockPosition {
+                    x: center.x + dx,
+                    y: center.y,
+                    z: center.z + dz,
+                },
+                planks,
+            );
+        }
+    }
+
+    for dy in 1..=3 {
+        for offset in -3i32..=3 {
+            for (dx, dz) in [(offset, -3), (offset, 3), (-3, offset), (3, offset)] {
+                let is_corner = dx.abs() == 3 && dz.abs() == 3;
+                let is_door = dz == -3 && dx == 0 && dy <= 2;
+                set_structure_block(
+                    chunk,
+                    target_chunk,
+                    BlockPosition {
+                        x: center.x + dx,
+                        y: center.y + dy,
+                        z: center.z + dz,
+                    },
+                    if is_door {
+                        air
+                    } else if is_corner {
+                        logs
+                    } else {
+                        planks
+                    },
+                );
+            }
+        }
+    }
+
+    for dz in -4i32..=4 {
+        for dx in -4i32..=4 {
+            set_structure_block(
+                chunk,
+                target_chunk,
+                BlockPosition {
+                    x: center.x + dx,
+                    y: center.y + 4,
+                    z: center.z + dz,
+                },
+                planks,
+            );
         }
     }
 }
@@ -866,5 +1205,94 @@ mod tests {
         let underground = &chunk.blocks[..((60 - MIN_Y) as usize * 256)];
         assert!(underground.iter().any(|state| *state == air));
         assert!(underground.iter().any(|state| *state == diamond));
+    }
+
+    #[test]
+    fn iron_generates_in_connected_clusters() {
+        let chunk = generate_chunk(0, 0, DEFAULT_WORLD_SEED);
+        let iron = [
+            pumpkin_data::Block::IRON_ORE.default_state.id,
+            pumpkin_data::Block::DEEPSLATE_IRON_ORE.default_state.id,
+        ];
+        let mut total = 0;
+        let mut connected = 0;
+        for y in MIN_Y + 1..MAX_Y {
+            for z in 1..15 {
+                for x in 1..15 {
+                    let index = block_index(x, y, z).unwrap();
+                    if !iron.contains(&chunk.blocks[index]) {
+                        continue;
+                    }
+                    total += 1;
+                    let neighbors = [
+                        (x - 1, y, z),
+                        (x + 1, y, z),
+                        (x, y - 1, z),
+                        (x, y + 1, z),
+                        (x, y, z - 1),
+                        (x, y, z + 1),
+                    ];
+                    if neighbors.iter().any(|(nx, ny, nz)| {
+                        iron.contains(&chunk.blocks[block_index(*nx, *ny, *nz).unwrap()])
+                    }) {
+                        connected += 1;
+                    }
+                }
+            }
+        }
+        assert!(total > 0);
+        assert!(
+            connected * 4 >= total * 3,
+            "iron was not sufficiently clustered"
+        );
+    }
+
+    #[test]
+    fn cave_noise_does_not_create_single_block_air_pockets() {
+        let chunk = generate_chunk(0, 0, DEFAULT_WORLD_SEED);
+        let air = pumpkin_data::Block::AIR.default_state.id;
+        for y in MIN_Y + 2..50 {
+            for z in 1..15 {
+                for x in 1..15 {
+                    if chunk.blocks[block_index(x, y, z).unwrap()] != air {
+                        continue;
+                    }
+                    let neighbors = [
+                        (x - 1, y, z),
+                        (x + 1, y, z),
+                        (x, y - 1, z),
+                        (x, y + 1, z),
+                        (x, y, z - 1),
+                        (x, y, z + 1),
+                    ];
+                    assert!(neighbors.iter().any(|(nx, ny, nz)| {
+                        chunk.blocks[block_index(*nx, *ny, *nz).unwrap()] == air
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cabins_are_chunk_context_aware() {
+        let air = pumpkin_data::Block::AIR.default_state.id;
+        let mut chunk = SavedChunk {
+            format_version: CHUNK_FORMAT_VERSION,
+            blocks: vec![air; BLOCKS_PER_CHUNK],
+            biomes: vec![TerrainBiome::Plains.protocol_id(); 256],
+            temperatures: vec![500; 256],
+            surface_y: vec![64; 256],
+        };
+        place_cabin(
+            &mut chunk,
+            ChunkPosition { x: 0, z: 0 },
+            BlockPosition { x: 15, y: 64, z: 8 },
+        );
+        assert!(chunk
+            .blocks
+            .contains(&pumpkin_data::Block::OAK_PLANKS.default_state.id));
+        assert!(chunk
+            .blocks
+            .contains(&pumpkin_data::Block::COBBLESTONE.default_state.id));
     }
 }
