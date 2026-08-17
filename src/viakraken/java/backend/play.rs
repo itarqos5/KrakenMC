@@ -656,11 +656,15 @@ pub async fn handle_play(
             }
             Ok(item_event) = item_rx.recv() => {
                 match item_event {
-                    crate::viakraken::java::backend::state::ItemEvent::Spawn { entity_id, item_id: _, x, y, z, vx, vy, vz } => {
+                    crate::viakraken::java::backend::state::ItemEvent::Spawn { entity_id, item_id, count, x, y, z, vx, vy, vz } => {
+                        let network_entity_type = pumpkin_data::entity_id_remap::remap_entity_id_for_version(
+                            pumpkin_data::entity::EntityType::ITEM.id,
+                            version,
+                        );
                         let spawn_pkt = CSpawnEntity::new(
                             VarInt(entity_id),
                             Uuid::new_v4(),
-                            VarInt(pumpkin_data::entity::EntityType::ITEM.id as i32),
+                            VarInt(network_entity_type as i32),
                             Vector3 { x, y, z },
                             0.0,
                             0.0,
@@ -670,6 +674,31 @@ pub async fn handle_play(
                         );
                         if let Ok(payload) = encode_java_packet(&spawn_pkt, version) {
                             let _ = write_framed_payload(stream, payload.as_slice()).await;
+                        }
+
+                        if let Some(item) = pumpkin_data::item::Item::from_id(item_id) {
+                            use pumpkin_data::{meta_data_type::MetaDataType, tracked_data::TrackedData};
+                            use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
+                            use pumpkin_protocol::java::client::play::{CSetEntityMetadata, Metadata};
+
+                            let stack = pumpkin_data::item_stack::ItemStack::new(count, item);
+                            let serialized = ItemStackSerializer::from(stack);
+                            let metadata = Metadata::new(
+                                TrackedData::ITEM,
+                                MetaDataType::ITEM_STACK,
+                                &serialized,
+                            );
+                            let mut metadata_bytes = Vec::new();
+                            if metadata.write(&mut metadata_bytes, &version).is_ok() {
+                                metadata_bytes.push(0xff);
+                                let packet = CSetEntityMetadata::new(
+                                    VarInt(entity_id),
+                                    metadata_bytes.into_boxed_slice(),
+                                );
+                                if let Ok(payload) = encode_java_packet(&packet, version) {
+                                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                                }
+                            }
                         }
 
                         use pumpkin_protocol::java::client::play::CEntityVelocity;

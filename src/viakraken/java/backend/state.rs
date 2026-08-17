@@ -125,7 +125,8 @@ pub fn gamemode_abilities(gamemode: u8) -> (i8, f32) {
 pub enum ItemEvent {
     Spawn {
         entity_id: i32,
-        item_id: i32,
+        item_id: u16,
+        count: u8,
         x: f64,
         y: f64,
         z: f64,

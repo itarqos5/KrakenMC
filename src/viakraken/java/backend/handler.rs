@@ -54,6 +54,26 @@ fn held_block_state(player: &PlayerData, hand: i32, version: MinecraftVersion) -
     pumpkin_data::Block::from_item_id(item_id).map(|block| block.default_state.id)
 }
 
+fn block_drop_item(state_id: u16) -> Option<&'static pumpkin_data::item::Item> {
+    let block = pumpkin_data::Block::from_state_id(state_id);
+    let item = match block.name {
+        "stone" => &pumpkin_data::item::Item::COBBLESTONE,
+        "deepslate" => &pumpkin_data::item::Item::COBBLED_DEEPSLATE,
+        "grass_block" => &pumpkin_data::item::Item::DIRT,
+        "coal_ore" | "deepslate_coal_ore" => &pumpkin_data::item::Item::COAL,
+        "copper_ore" | "deepslate_copper_ore" => &pumpkin_data::item::Item::RAW_COPPER,
+        "iron_ore" | "deepslate_iron_ore" => &pumpkin_data::item::Item::RAW_IRON,
+        "gold_ore" | "deepslate_gold_ore" => &pumpkin_data::item::Item::RAW_GOLD,
+        "diamond_ore" | "deepslate_diamond_ore" => &pumpkin_data::item::Item::DIAMOND,
+        "emerald_ore" | "deepslate_emerald_ore" => &pumpkin_data::item::Item::EMERALD,
+        "lapis_ore" | "deepslate_lapis_ore" => &pumpkin_data::item::Item::LAPIS_LAZULI,
+        "redstone_ore" | "deepslate_redstone_ore" => &pumpkin_data::item::Item::REDSTONE,
+        _ if block.item_id != 0 => pumpkin_data::item::Item::from_id(block.item_id)?,
+        _ => return None,
+    };
+    Some(item)
+}
+
 pub async fn handle_play_packet(
     stream: &mut TcpStream,
     version: MinecraftVersion,
@@ -214,7 +234,8 @@ pub async fn handle_play_packet(
                 0
             };
 
-            if status == 2 || (status == 0 && player.gamemode == 1) {
+            if (status == 2 && player.gamemode != 3) || (status == 0 && player.gamemode == 1) {
+                let broken_state = get_block_state(db, x, y, z);
                 save_block_change(db, x, y, z, 0);
                 let _ = block_channel().send(BlockUpdateEvent {
                     x,
@@ -223,20 +244,23 @@ pub async fn handle_play_packet(
                     state_id: pumpkin_data::Block::AIR.default_state.id,
                 });
 
-                if player.gamemode != 1 {
+                if matches!(player.gamemode, 0 | 2) {
                     use super::state::{item_event_channel, ItemEvent, NEXT_ENTITY_ID};
-                    let item_entity_id =
-                        NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let _ = item_event_channel().send(ItemEvent::Spawn {
-                        entity_id: item_entity_id,
-                        item_id: 1,
-                        x: x as f64 + 0.5,
-                        y: y as f64 + 0.5,
-                        z: z as f64 + 0.5,
-                        vx: 0.0,
-                        vy: 0.2,
-                        vz: 0.0,
-                    });
+                    if let Some(item) = block_drop_item(broken_state) {
+                        let item_entity_id =
+                            NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = item_event_channel().send(ItemEvent::Spawn {
+                            entity_id: item_entity_id,
+                            item_id: item.id,
+                            count: 1,
+                            x: x as f64 + 0.5,
+                            y: y as f64 + 0.5,
+                            z: z as f64 + 0.5,
+                            vx: 0.0,
+                            vy: 0.2,
+                            vz: 0.0,
+                        });
+                    }
                 }
             } else if status == 3 || status == 4 {
                 use super::state::{item_event_channel, ItemEvent, NEXT_ENTITY_ID};
@@ -251,6 +275,7 @@ pub async fn handle_play_packet(
                 let _ = item_event_channel().send(ItemEvent::Spawn {
                     entity_id: item_entity_id,
                     item_id: 1,
+                    count: 1,
                     x: player.x,
                     y: player.y + 1.5,
                     z: player.z,
@@ -630,5 +655,18 @@ mod tests {
     fn empty_hand_has_no_placeable_block() {
         let player = PlayerData::default();
         assert_eq!(held_block_state(&player, 0, MinecraftVersion::V_26_1), None);
+    }
+
+    #[test]
+    fn terrain_blocks_use_survival_style_drops() {
+        assert_eq!(
+            block_drop_item(pumpkin_data::Block::STONE.default_state.id).map(|item| item.id),
+            Some(pumpkin_data::item::Item::COBBLESTONE.id)
+        );
+        assert_eq!(
+            block_drop_item(pumpkin_data::Block::COPPER_ORE.default_state.id).map(|item| item.id),
+            Some(pumpkin_data::item::Item::RAW_COPPER.id)
+        );
+        assert!(block_drop_item(pumpkin_data::Block::AIR.default_state.id).is_none());
     }
 }
