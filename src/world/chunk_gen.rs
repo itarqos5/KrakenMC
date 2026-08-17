@@ -9,7 +9,7 @@ use noise::{NoiseFn, Perlin};
 use pumpkin_util::version::MinecraftVersion;
 use serde::{Deserialize, Serialize};
 
-const CHUNK_FORMAT_VERSION: u8 = 2;
+const CHUNK_FORMAT_VERSION: u8 = 3;
 const SECTION_COUNT: usize = 24;
 const MIN_Y: i32 = -64;
 const MAX_Y: i32 = 319;
@@ -663,15 +663,6 @@ fn generate_chunk(chunk_x: i32, chunk_z: i32, seed: i64) -> SavedChunk {
         &temperature_noise,
         &moisture_noise,
     );
-    add_contextual_structures(
-        &mut chunk,
-        chunk_x,
-        chunk_z,
-        seed,
-        &terrain_noise,
-        &temperature_noise,
-        &moisture_noise,
-    );
     chunk
 }
 
@@ -826,144 +817,6 @@ fn place_tree(
                     true,
                 );
             }
-        }
-    }
-}
-
-fn add_contextual_structures(
-    chunk: &mut SavedChunk,
-    chunk_x: i32,
-    chunk_z: i32,
-    seed: i64,
-    terrain_noise: &Perlin,
-    temperature_noise: &Perlin,
-    moisture_noise: &Perlin,
-) {
-    const REGION_SIZE: i32 = 10;
-    let target_region_x = chunk_x.div_euclid(REGION_SIZE);
-    let target_region_z = chunk_z.div_euclid(REGION_SIZE);
-    for region_z in target_region_z - 1..=target_region_z + 1 {
-        for region_x in target_region_x - 1..=target_region_x + 1 {
-            let hash = coordinate_hash(seed ^ 0x5354_5255_4354, region_x, 0, region_z);
-            if !hash.is_multiple_of(3) {
-                continue;
-            }
-            let source_chunk_x = region_x * REGION_SIZE + ((hash >> 8) % REGION_SIZE as u64) as i32;
-            let source_chunk_z =
-                region_z * REGION_SIZE + ((hash >> 20) % REGION_SIZE as u64) as i32;
-            let world_x = source_chunk_x * 16 + 8;
-            let world_z = source_chunk_z * 16 + 8;
-            let (biome, _) = climate_at(world_x, world_z, temperature_noise, moisture_noise);
-            if matches!(biome, TerrainBiome::Desert | TerrainBiome::SnowyPlains) {
-                continue;
-            }
-            let surface = surface_height_at(world_x, world_z, biome, terrain_noise).clamp(34, 180);
-            if surface < 63 {
-                continue;
-            }
-            place_cabin(
-                chunk,
-                ChunkPosition {
-                    x: chunk_x,
-                    z: chunk_z,
-                },
-                BlockPosition {
-                    x: world_x,
-                    y: surface,
-                    z: world_z,
-                },
-            );
-        }
-    }
-}
-
-fn set_structure_block(
-    chunk: &mut SavedChunk,
-    target_chunk: ChunkPosition,
-    position: BlockPosition,
-    state: u16,
-) {
-    if position.x >> 4 != target_chunk.x || position.z >> 4 != target_chunk.z {
-        return;
-    }
-    let Some(index) = block_index(
-        (position.x & 15) as usize,
-        position.y,
-        (position.z & 15) as usize,
-    ) else {
-        return;
-    };
-    chunk.blocks[index] = state;
-}
-
-fn place_cabin(chunk: &mut SavedChunk, target_chunk: ChunkPosition, center: BlockPosition) {
-    let cobblestone = pumpkin_data::Block::COBBLESTONE.default_state.id;
-    let planks = pumpkin_data::Block::OAK_PLANKS.default_state.id;
-    let logs = pumpkin_data::Block::OAK_LOG.default_state.id;
-    let air = pumpkin_data::Block::AIR.default_state.id;
-
-    for dz in -3i32..=3 {
-        for dx in -3i32..=3 {
-            set_structure_block(
-                chunk,
-                target_chunk,
-                BlockPosition {
-                    x: center.x + dx,
-                    y: center.y - 1,
-                    z: center.z + dz,
-                },
-                cobblestone,
-            );
-            set_structure_block(
-                chunk,
-                target_chunk,
-                BlockPosition {
-                    x: center.x + dx,
-                    y: center.y,
-                    z: center.z + dz,
-                },
-                planks,
-            );
-        }
-    }
-
-    for dy in 1..=3 {
-        for offset in -3i32..=3 {
-            for (dx, dz) in [(offset, -3), (offset, 3), (-3, offset), (3, offset)] {
-                let is_corner = dx.abs() == 3 && dz.abs() == 3;
-                let is_door = dz == -3 && dx == 0 && dy <= 2;
-                set_structure_block(
-                    chunk,
-                    target_chunk,
-                    BlockPosition {
-                        x: center.x + dx,
-                        y: center.y + dy,
-                        z: center.z + dz,
-                    },
-                    if is_door {
-                        air
-                    } else if is_corner {
-                        logs
-                    } else {
-                        planks
-                    },
-                );
-            }
-        }
-    }
-
-    for dz in -4i32..=4 {
-        for dx in -4i32..=4 {
-            set_structure_block(
-                chunk,
-                target_chunk,
-                BlockPosition {
-                    x: center.x + dx,
-                    y: center.y + 4,
-                    z: center.z + dz,
-                },
-                planks,
-            );
         }
     }
 }
@@ -1292,29 +1145,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn cabins_are_chunk_context_aware() {
-        let air = pumpkin_data::Block::AIR.default_state.id;
-        let mut chunk = SavedChunk {
-            format_version: CHUNK_FORMAT_VERSION,
-            blocks: vec![air; BLOCKS_PER_CHUNK],
-            biomes: vec![TerrainBiome::Plains.protocol_id(); 256],
-            temperatures: vec![500; 256],
-            surface_y: vec![64; 256],
-        };
-        place_cabin(
-            &mut chunk,
-            ChunkPosition { x: 0, z: 0 },
-            BlockPosition { x: 15, y: 64, z: 8 },
-        );
-        assert!(chunk
-            .blocks
-            .contains(&pumpkin_data::Block::OAK_PLANKS.default_state.id));
-        assert!(chunk
-            .blocks
-            .contains(&pumpkin_data::Block::COBBLESTONE.default_state.id));
     }
 
     #[test]
