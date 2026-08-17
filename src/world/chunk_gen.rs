@@ -256,6 +256,27 @@ pub fn get_block_state(db: &Arc<sled::Db>, x: i32, y: i32, z: i32) -> u16 {
     get_or_generate_chunk(db, chunk_x, chunk_z).blocks[index]
 }
 
+pub fn has_open_sky(db: &Arc<sled::Db>, x: i32, y: i32, z: i32) -> bool {
+    let chunk_x = x >> 4;
+    let chunk_z = z >> 4;
+    let chunk = get_or_generate_chunk(db, chunk_x, chunk_z);
+    let modifications = get_chunk_mods(db, chunk_x, chunk_z);
+    let air = pumpkin_data::Block::AIR.default_state.id;
+    for check_y in (y + 1).max(MIN_Y)..=MAX_Y {
+        let Some(index) = block_index((x & 15) as usize, check_y, (z & 15) as usize) else {
+            continue;
+        };
+        let state = modifications
+            .get(&(index as u32))
+            .copied()
+            .unwrap_or(chunk.blocks[index]);
+        if state != air {
+            return false;
+        }
+    }
+    true
+}
+
 fn smoothstep(value: f64) -> f64 {
     value * value * (3.0 - 2.0 * value)
 }
@@ -1294,5 +1315,13 @@ mod tests {
         assert!(chunk
             .blocks
             .contains(&pumpkin_data::Block::COBBLESTONE.default_state.id));
+    }
+
+    #[test]
+    fn overhead_blocks_prevent_open_sky() {
+        let db = Arc::new(sled::Config::new().temporary(true).open().unwrap());
+        assert!(has_open_sky(&db, 0, 300, 0));
+        save_block_change(&db, 0, 310, 0, pumpkin_data::Block::STONE.default_state.id);
+        assert!(!has_open_sky(&db, 0, 300, 0));
     }
 }

@@ -20,6 +20,7 @@ Kraken is a high-performance Rust-based Minecraft server engine designed for low
 - 💾 **Persistence:** Embedded **Sled** storage for player state, compressed generated chunks, biome climate, and block modifications.
 - 🌍 **World Generation:** Contextual biome borders, temperature, caves, depth-aware ores, and cross-chunk trees with on-demand chunk streaming.
 - 👁️ **View Distance:** Honors each client's render-distance preference up to the configurable `view-distance` server limit (default 16).
+- ☀️ **Daylight Mobs:** Summoned zombies burn and die when exposed to daytime sky; husks remain sunlight-immune.
 
 ## 🚀 Getting Started
 

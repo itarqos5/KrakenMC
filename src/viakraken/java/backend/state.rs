@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use uuid::Uuid;
 
 pub fn chat_channel() -> &'static tokio::sync::broadcast::Sender<String> {
@@ -97,6 +98,56 @@ pub fn online_players() -> &'static Mutex<HashMap<Uuid, OnlinePlayer>> {
 }
 
 pub static NEXT_ENTITY_ID: AtomicI32 = AtomicI32::new(1);
+
+#[derive(Clone, Debug)]
+pub struct SummonedEntity {
+    pub entity_id: i32,
+    pub entity_type: u16,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub health: f32,
+    pub burning: bool,
+    pub last_burn_damage: Instant,
+}
+
+pub fn summoned_entities() -> &'static Mutex<HashMap<i32, SummonedEntity>> {
+    static ENTITIES: OnceLock<Mutex<HashMap<i32, SummonedEntity>>> = OnceLock::new();
+    ENTITIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_summoned_entity(entity_id: i32, entity_type: u16, x: f64, y: f64, z: f64) {
+    if let Ok(mut entities) = summoned_entities().lock() {
+        entities.insert(
+            entity_id,
+            SummonedEntity {
+                entity_id,
+                entity_type,
+                x,
+                y,
+                z,
+                health: 20.0,
+                burning: false,
+                last_burn_damage: Instant::now(),
+            },
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SummonedEntityEvent {
+    Burning { entity_id: i32, burning: bool },
+    Hurt { entity_id: i32 },
+    Remove { entity_id: i32 },
+}
+
+pub fn summoned_entity_channel() -> &'static tokio::sync::broadcast::Sender<SummonedEntityEvent> {
+    static CHANNEL: OnceLock<tokio::sync::broadcast::Sender<SummonedEntityEvent>> = OnceLock::new();
+    CHANNEL.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(128);
+        tx
+    })
+}
 
 #[derive(Clone, Debug)]
 pub enum ConsoleCommand {

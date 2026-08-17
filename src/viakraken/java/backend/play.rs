@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::io::Error;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -24,14 +26,123 @@ use crate::logger::{log_info, log_warn};
 use crate::operator_store::operator_level;
 use crate::viakraken::java::packets::encode_java_packet;
 use crate::viakraken::utils::{read_varint_from_slice, write_framed_payload};
-use crate::world::chunk_gen::encode_chunk_packet;
+use crate::world::chunk_gen::{encode_chunk_packet, has_open_sky};
 use crate::world::player_store::{load_player, save_player};
 
 use super::handler::{change_gamemode, handle_play_packet};
 use super::state::{
     block_channel, chat_channel, console_command_channel, gamemode_abilities, online_players,
-    player_event_channel, ConsoleCommand, OnlinePlayer, PlayerEvent, NEXT_ENTITY_ID,
+    player_event_channel, summoned_entities, summoned_entity_channel, ConsoleCommand, OnlinePlayer,
+    PlayerEvent, SummonedEntity, SummonedEntityEvent, NEXT_ENTITY_ID,
 };
+
+fn world_time_ticks() -> i64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed();
+    (elapsed.as_secs_f64() * 20.0) as i64
+}
+
+fn is_daytime(ticks: i64) -> bool {
+    ticks.rem_euclid(24_000) < 12_000
+}
+
+fn burns_in_daylight(entity_type: u16) -> bool {
+    entity_type == pumpkin_data::entity::EntityType::ZOMBIE.id
+}
+
+fn tick_summoned_zombies(db: &Arc<sled::Db>) {
+    static LAST_TICK: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let now = Instant::now();
+    let Ok(mut last_tick) = LAST_TICK
+        .get_or_init(|| Mutex::new(now - Duration::from_secs(1)))
+        .lock()
+    else {
+        return;
+    };
+    if now.duration_since(*last_tick) < Duration::from_millis(900) {
+        return;
+    }
+    *last_tick = now;
+    drop(last_tick);
+
+    let daytime = is_daytime(world_time_ticks());
+    let snapshots = summoned_entities()
+        .lock()
+        .map(|entities| entities.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for snapshot in snapshots {
+        if !burns_in_daylight(snapshot.entity_type) {
+            continue;
+        }
+        let exposed = daytime
+            && has_open_sky(
+                db,
+                snapshot.x.floor() as i32,
+                snapshot.y.floor() as i32 + 1,
+                snapshot.z.floor() as i32,
+            );
+        let Ok(mut entities) = summoned_entities().lock() else {
+            continue;
+        };
+        let Some(entity) = entities.get_mut(&snapshot.entity_id) else {
+            continue;
+        };
+        if !exposed {
+            if entity.burning {
+                entity.burning = false;
+                let _ = summoned_entity_channel().send(SummonedEntityEvent::Burning {
+                    entity_id: entity.entity_id,
+                    burning: false,
+                });
+            }
+            continue;
+        }
+        if !entity.burning {
+            entity.burning = true;
+            let _ = summoned_entity_channel().send(SummonedEntityEvent::Burning {
+                entity_id: entity.entity_id,
+                burning: true,
+            });
+        }
+        if now.duration_since(entity.last_burn_damage) >= Duration::from_millis(900) {
+            entity.last_burn_damage = now;
+            entity.health -= 4.0;
+            let entity_id = entity.entity_id;
+            if entity.health <= 0.0 {
+                entities.remove(&entity_id);
+                let _ = summoned_entity_channel().send(SummonedEntityEvent::Remove { entity_id });
+            } else {
+                let _ = summoned_entity_channel().send(SummonedEntityEvent::Hurt { entity_id });
+            }
+        }
+    }
+}
+
+async fn send_summoned_entity(
+    stream: &mut TcpStream,
+    version: MinecraftVersion,
+    entity: &SummonedEntity,
+) -> std::io::Result<()> {
+    let network_entity_type =
+        pumpkin_data::entity_id_remap::remap_entity_id_for_version(entity.entity_type, version);
+    let packet = CSpawnEntity::new(
+        VarInt(entity.entity_id),
+        Uuid::new_v4(),
+        VarInt(network_entity_type as i32),
+        Vector3 {
+            x: entity.x,
+            y: entity.y,
+            z: entity.z,
+        },
+        0.0,
+        0.0,
+        0.0,
+        VarInt(0),
+        Vector3::new(0.0, 0.0, 0.0),
+    );
+    let payload = encode_java_packet(&packet, version)?;
+    write_framed_payload(stream, payload.as_slice()).await
+}
 
 pub(super) async fn send_permission_status(
     stream: &mut TcpStream,
@@ -465,6 +576,14 @@ pub async fn handle_play(
     )
     .await?;
 
+    let existing_summons = summoned_entities()
+        .lock()
+        .map(|entities| entities.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for entity in &existing_summons {
+        send_summoned_entity(stream, version, entity).await?;
+    }
+
     {
         let brand_data = b"\x06Kraken";
         let brand_pkt = CCustomPayload::new("minecraft:brand", brand_data);
@@ -483,6 +602,7 @@ pub async fn handle_play(
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut save_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut entity_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     save_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     save_interval.reset();
     let mut keep_alive_id = 0i64;
@@ -493,6 +613,7 @@ pub async fn handle_play(
     let mut event_rx = player_event_channel().subscribe();
     let mut item_rx = crate::viakraken::java::backend::state::item_event_channel().subscribe();
     let mut console_rx = console_command_channel().subscribe();
+    let mut summoned_entity_rx = summoned_entity_channel().subscribe();
 
     'play: loop {
         tokio::select! {
@@ -519,23 +640,21 @@ pub async fn handle_play(
                         log_info!("Set {} to game mode {} from the console.", username, gamemode);
                     }
                     ConsoleCommand::Summon { entity_id, entity_type, x, y, z } => {
-                        let network_entity_type = pumpkin_data::entity_id_remap::remap_entity_id_for_version(
-                            entity_type,
-                            version,
-                        );
-                        let packet = CSpawnEntity::new(
-                            VarInt(entity_id),
-                            Uuid::new_v4(),
-                            VarInt(network_entity_type as i32),
-                            Vector3 { x, y, z },
-                            0.0,
-                            0.0,
-                            0.0,
-                            VarInt(0),
-                            Vector3::new(0.0, 0.0, 0.0),
-                        );
-                        let payload = encode_java_packet(&packet, version)?;
-                        write_framed_payload(stream, payload.as_slice()).await?;
+                        let entity = summoned_entities()
+                            .lock()
+                            .ok()
+                            .and_then(|entities| entities.get(&entity_id).cloned())
+                            .unwrap_or(SummonedEntity {
+                                entity_id,
+                                entity_type,
+                                x,
+                                y,
+                                z,
+                                health: 20.0,
+                                burning: false,
+                                last_burn_damage: Instant::now(),
+                            });
+                        send_summoned_entity(stream, version, &entity).await?;
                     }
                     _ => {}
                 }
@@ -784,10 +903,63 @@ pub async fn handle_play(
                     let _ = write_framed_payload(stream, payload.as_slice()).await;
                 }
             }
+            Ok(event) = summoned_entity_rx.recv() => {
+                match event {
+                    SummonedEntityEvent::Burning { entity_id, burning } => {
+                        use pumpkin_data::{meta_data_type::MetaDataType, tracked_data::TrackedId};
+                        use pumpkin_protocol::java::client::play::{CSetEntityMetadata, Metadata};
+                        let flags_index = TrackedId {
+                            v1_21: 0,
+                            v1_21_2: 0,
+                            v1_21_4: 0,
+                            v1_21_5: 0,
+                            v1_21_6: 0,
+                            v1_21_7: 0,
+                            v1_21_9: 0,
+                            v1_21_11: 0,
+                            v26_1: 0,
+                        };
+                        let flags: i8 = if burning { 0x01 } else { 0x00 };
+                        let metadata = Metadata::new(flags_index, MetaDataType::BYTE, flags);
+                        let mut metadata_bytes = Vec::new();
+                        if metadata.write(&mut metadata_bytes, &version).is_ok() {
+                            metadata_bytes.push(0xff);
+                            let packet = CSetEntityMetadata::new(
+                                VarInt(entity_id),
+                                metadata_bytes.into_boxed_slice(),
+                            );
+                            if let Ok(payload) = encode_java_packet(&packet, version) {
+                                let _ = write_framed_payload(stream, payload.as_slice()).await;
+                            }
+                        }
+                    }
+                    SummonedEntityEvent::Hurt { entity_id } => {
+                        let packet = CEntityStatus::new(entity_id, 2);
+                        if let Ok(payload) = encode_java_packet(&packet, version) {
+                            let _ = write_framed_payload(stream, payload.as_slice()).await;
+                        }
+                    }
+                    SummonedEntityEvent::Remove { entity_id } => {
+                        let ids = [VarInt(entity_id)];
+                        let packet = CRemoveEntities::new(&ids);
+                        if let Ok(payload) = encode_java_packet(&packet, version) {
+                            let _ = write_framed_payload(stream, payload.as_slice()).await;
+                        }
+                    }
+                }
+            }
+            _ = entity_interval.tick() => {
+                tick_summoned_zombies(&db);
+            }
             _ = interval.tick() => {
                 keep_alive_id = keep_alive_id.wrapping_add(1);
                 let ka = CKeepAlive::new(keep_alive_id);
                 if let Ok(payload) = encode_java_packet(&ka, version) {
+                    let _ = write_framed_payload(stream, payload.as_slice()).await;
+                }
+                let ticks = world_time_ticks();
+                let time = pumpkin_protocol::java::client::play::CUpdateTime::new(ticks, ticks, true);
+                if let Ok(payload) = encode_java_packet(&time, version) {
                     let _ = write_framed_payload(stream, payload.as_slice()).await;
                 }
             }
@@ -907,5 +1079,17 @@ mod tests {
     #[test]
     fn client_view_distance_controls_streaming_radius() {
         assert_eq!(chunks_in_view(0, 0, 12).len(), 625);
+    }
+
+    #[test]
+    fn zombies_burn_in_daylight_but_husks_do_not() {
+        assert!(burns_in_daylight(
+            pumpkin_data::entity::EntityType::ZOMBIE.id
+        ));
+        assert!(!burns_in_daylight(
+            pumpkin_data::entity::EntityType::HUSK.id
+        ));
+        assert!(is_daytime(6_000));
+        assert!(!is_daytime(18_000));
     }
 }

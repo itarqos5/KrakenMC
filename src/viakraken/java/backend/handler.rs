@@ -24,7 +24,8 @@ use crate::world::player_store::PlayerData;
 use super::play::{send_command_tree, send_permission_status};
 use super::state::{
     block_channel, chat_channel, console_command_channel, gamemode_abilities, online_players,
-    player_event_channel, BlockUpdateEvent, ConsoleCommand, PlayerEvent, NEXT_ENTITY_ID,
+    player_event_channel, register_summoned_entity, BlockUpdateEvent, ConsoleCommand, PlayerEvent,
+    NEXT_ENTITY_ID,
 };
 
 const PLAYER_INVENTORY_SLOTS: usize = 46;
@@ -657,6 +658,13 @@ async fn handle_command(
                 (player.x, player.y, player.z)
             };
             let entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            register_summoned_entity(
+                entity_id,
+                entity_type.id,
+                coordinates.0,
+                coordinates.1,
+                coordinates.2,
+            );
             let _ = console_command_channel().send(ConsoleCommand::Summon {
                 entity_id,
                 entity_type: entity_type.id,

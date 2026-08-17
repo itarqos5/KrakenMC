@@ -3,7 +3,8 @@ use std::io::{self, BufRead};
 use crate::logger::{log_error, log_info, log_warn};
 use crate::operator_store::{remove_operator, set_operator};
 use crate::viakraken::java::backend::state::{
-    console_command_channel, online_players, ConsoleCommand, OnlinePlayer, NEXT_ENTITY_ID,
+    console_command_channel, online_players, register_summoned_entity, ConsoleCommand,
+    OnlinePlayer, NEXT_ENTITY_ID,
 };
 
 pub fn spawn_console() {
@@ -106,6 +107,13 @@ fn execute(input: &str) {
                 (0.0, 0.0, 0.0)
             };
             let entity_id = NEXT_ENTITY_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            register_summoned_entity(
+                entity_id,
+                entity_type.id,
+                coordinates.0,
+                coordinates.1,
+                coordinates.2,
+            );
             let _ = console_command_channel().send(ConsoleCommand::Summon {
                 entity_id,
                 entity_type: entity_type.id,
