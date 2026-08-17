@@ -33,8 +33,8 @@ use super::handler::{change_gamemode, handle_play_packet};
 use super::state::{
     block_channel, chat_channel, claim_nearby_dropped_item, console_command_channel,
     gamemode_abilities, item_event_channel, online_players, player_event_channel,
-    summoned_entities, summoned_entity_channel, ConsoleCommand, OnlinePlayer, PlayerEvent,
-    SummonedEntity, SummonedEntityEvent, NEXT_ENTITY_ID,
+    spawn_dropped_item, summoned_entities, summoned_entity_channel, ConsoleCommand, OnlinePlayer,
+    PlayerEvent, SummonedEntity, SummonedEntityEvent, NEXT_ENTITY_ID,
 };
 
 fn has_empty_drop_slot(player: &PlayerData) -> bool {
@@ -86,6 +86,18 @@ fn is_daytime(ticks: i64) -> bool {
 
 fn burns_in_daylight(entity_type: u16) -> bool {
     entity_type == pumpkin_data::entity::EntityType::ZOMBIE.id
+}
+
+fn entity_death_loot(entity_type: u16) -> Option<(u16, u8)> {
+    if matches!(
+        entity_type,
+        id if id == pumpkin_data::entity::EntityType::ZOMBIE.id
+            || id == pumpkin_data::entity::EntityType::HUSK.id
+    ) {
+        Some((pumpkin_data::item::Item::ROTTEN_FLESH.id, 1))
+    } else {
+        None
+    }
 }
 
 fn tick_summoned_zombies(db: &Arc<sled::Db>) {
@@ -147,8 +159,13 @@ fn tick_summoned_zombies(db: &Arc<sled::Db>) {
             entity.health -= 4.0;
             let entity_id = entity.entity_id;
             if entity.health <= 0.0 {
+                let (entity_type, x, y, z) = (entity.entity_type, entity.x, entity.y, entity.z);
                 entities.remove(&entity_id);
+                drop(entities);
                 let _ = summoned_entity_channel().send(SummonedEntityEvent::Remove { entity_id });
+                if let Some((item_id, count)) = entity_death_loot(entity_type) {
+                    spawn_dropped_item(item_id, count, x, y + 0.25, z, 0.0, 0.2, 0.0);
+                }
             } else {
                 let _ = summoned_entity_channel().send(SummonedEntityEvent::Hurt { entity_id });
             }
@@ -1155,5 +1172,23 @@ mod tests {
         ));
         assert!(is_daytime(6_000));
         assert!(!is_daytime(18_000));
+    }
+
+    #[test]
+    fn undead_zombies_drop_rotten_flesh() {
+        let expected = Some((pumpkin_data::item::Item::ROTTEN_FLESH.id, 1));
+
+        assert_eq!(
+            entity_death_loot(pumpkin_data::entity::EntityType::ZOMBIE.id),
+            expected
+        );
+        assert_eq!(
+            entity_death_loot(pumpkin_data::entity::EntityType::HUSK.id),
+            expected
+        );
+        assert_eq!(
+            entity_death_loot(pumpkin_data::entity::EntityType::COW.id),
+            None
+        );
     }
 }
