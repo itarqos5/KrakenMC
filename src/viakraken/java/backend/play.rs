@@ -519,6 +519,9 @@ pub async fn handle_play(
 
     send_permission_status(stream, version, my_entity_id, player.operator_level).await?;
     send_command_tree(stream, version, player.operator_level > 0).await?;
+    let recipes = pumpkin_protocol::java::client::play::CRecipeBookAdd::new(true);
+    let payload = encode_java_packet(&recipes, version)?;
+    write_framed_payload(stream, payload.as_slice()).await?;
 
     {
         let flags = (PlayerInfoFlags::ADD_PLAYER

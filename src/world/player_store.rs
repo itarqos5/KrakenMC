@@ -13,6 +13,9 @@ pub struct PlayerData {
     /// 0=survival 1=creative 2=adventure 3=spectator
     pub gamemode: u8,
     pub inventory: Vec<Vec<u8>>,
+    /// Runtime cursor stack used by container clicks; never persisted.
+    #[serde(skip)]
+    pub carried_item: Vec<u8>,
     #[serde(default)]
     pub highest_y: f64,
     #[serde(default)]
@@ -38,6 +41,7 @@ impl Default for PlayerData {
             pitch: 0.0,
             gamemode: 0, // new players start in survival
             inventory: vec![Vec::new(); 46],
+            carried_item: Vec::new(),
             highest_y: 70.0,
             held_slot: 0,
             health: 20.0,
